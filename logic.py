@@ -171,9 +171,11 @@ def set_total_rounds(n):
             db.upsert_schedule_row(rnd, None, None)
     db.delete_schedule_rows_above(n)
     db.set_setting("total_rounds", n)
-    # Clamp every game's round to the new maximum.
+    # Clamp the round to the new maximum — only for the game whose layout changed
+    # (each game has its own schedule); with no game context, every game.
+    gid = db.active_game_id()
     for g in db.list_games():
-        if int(g["current_round"]) > n:
+        if (gid is None or g["id"] == gid) and int(g["current_round"]) > n:
             db.set_game_round(g["id"], n)
 
 
@@ -1495,9 +1497,62 @@ def _today():
     return datetime.now(timezone.utc).date().isoformat()
 
 
+def interpretive_strength(evidence_type, dims, sample_n=None, limitations=None):
+    """Strength of an item from TBI's four contrasts (as picked by the team), capped by
+    the evidence type they chose and by known ceilings (e.g. letters of intent are
+    usually not binding). Returns (strength, reasons) — reasons are plain-language
+    statements; the arithmetic is deliberately not shown to students."""
+    ladder = content.EVIDENCE_LADDER_MAP.get(evidence_type, 0)
+    reasons = []
+    pts = 0
+    for key, _q, _opts, (weak, strong) in content.STRENGTH_DIMENSIONS:
+        if dims.get(key):
+            pts += 2
+            reasons.append(f"it rests on {strong}")
+        else:
+            reasons.append(f"it rests on {weak}")
+    if sample_n and int(sample_n) >= content.STRENGTH_SAMPLE_BONUS_N:
+        pts += 1
+        reasons.append(f"it covers {int(sample_n)} people/observations")
+    if (limitations or "").strip():
+        pts += 1
+        reasons.append("you named its limitations")
+    strength = min(10, pts, ladder)
+    if strength == ladder and pts > ladder:
+        reasons.append(f"the type you chose (\"{evidence_type}\") sets its ceiling")
+    cap = content.NONBINDING_TYPES.get(evidence_type)
+    if cap is not None and strength > cap:
+        strength = cap
+        reasons.append("letters of intent are usually not binding, so they're counted below "
+                       "an actual payment")
+    return int(strength), reasons
+
+
+def _word_set(text):
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) > 2}
+
+
+def find_similar_evidence(team_id, description, source):
+    """An existing counted item whose wording overlaps this one heavily (a likely
+    re-log with small edits), or None. Similarity = shared words / all words."""
+    words = _word_set(f"{description} {source}")
+    if len(words) < 3:
+        return None
+    best, best_sim = None, 0.0
+    for e in db.list_counted_evidence(team_id):
+        other = _word_set(f"{e['description']} {e.get('source') or ''}")
+        if not other:
+            continue
+        sim = len(words & other) / len(words | other)
+        if sim > best_sim:
+            best, best_sim = e, sim
+    return best if best_sim >= content.NEAR_DUPLICATE_SIMILARITY else None
+
+
 def log_evidence(team_id, description, evidence_type, source, justification,
                  assumption_id=None, direction=None, origin="Real-world",
-                 collected_on=None, sample_n=None, limitations=None):
+                 collected_on=None, sample_n=None, limitations=None,
+                 interpretation=None, dims=None):
     """Validate and log one evidence item; pay its credit per the Stage 1 rules.
 
     Returns a dict: ok, message, evidence_id, paid, status, pending, flags, strength.
@@ -1530,11 +1585,28 @@ def log_evidence(team_id, description, evidence_type, source, justification,
         out["message"] = ("Say whether this supports, contradicts, or is inconclusive for the "
                           "linked assumption.")
         return out
-    strength = 0 if practice else content.EVIDENCE_LADDER_MAP[evidence_type]
+    if (assumption_id is not None and dims is not None and not practice
+            and not (interpretation or "").strip()):
+        out["message"] = ("Add your interpretation: what does this observation mean for the "
+                          "linked assumption? (Keep it separate from what you observed.)")
+        return out
+    reasons = []
+    ladder = content.EVIDENCE_LADDER_MAP[evidence_type]
+    if practice:
+        strength = 0
+    elif dims is not None:
+        strength, reasons = interpretive_strength(evidence_type, dims, sample_n, limitations)
+    else:
+        strength = ladder                         # API/back-compat path: type value
     flags = [] if practice else evidence_flags(description, source, strength)
+    similar = None if practice else find_similar_evidence(team_id, description, source)
+    if similar is not None:
+        flags = flags + [f"This looks very similar to evidence item #{similar['id']} you already "
+                         "logged. If it's the same observation, withdraw one; if it's new, "
+                         "say what's different."]
     if practice:
         status, award = "Practice", 0.0
-    elif strength <= content.EVIDENCE_AUTO_ACCEPT_MAX_STRENGTH and not flags:
+    elif (strength < content.EVIDENCE_REVIEW_MIN_STRENGTH and not flags):
         status = "Auto-accepted"
         award = content.EVIDENCE_BASE_CREDIT + evidence_release(strength)
     else:
@@ -1549,6 +1621,11 @@ def log_evidence(team_id, description, evidence_type, source, justification,
         "limitations": (limitations or "").strip() or None,
         "review_status": status,
         "dedupe_key": db._normalize_dedupe(description, source),
+        "interpretation": (interpretation or "").strip() or None,
+        "strength_dims": json.dumps(dims) if dims is not None else None,
+        "ladder_strength": ladder,
+        "strength_reasons": json.dumps(reasons) if reasons else None,
+        "similar_to": similar["id"] if similar is not None else None,
     }
     rnd = db.current_round()
     kind, val, paid = db.insert_evidence_tx(team_id, fields, award,
@@ -1564,7 +1641,8 @@ def log_evidence(team_id, description, evidence_type, source, justification,
         out["message"] = val
         return out
     out.update({"ok": True, "evidence_id": val, "paid": paid, "status": status,
-                "pending": status == "Pending review", "flags": flags, "strength": strength})
+                "pending": status == "Pending review", "flags": flags, "strength": strength,
+                "reasons": reasons})
     if practice:
         out["message"] = "Saved as AI practice — useful rehearsal, but it earns no credit."
     elif status == "Pending review":
@@ -1676,13 +1754,39 @@ class _ReviewRefused(Exception):
     pass
 
 
-def review_queue(team_ids):
-    """Evidence awaiting the instructor: Pending review or Needs artifact, oldest first."""
+def spot_check_item(team_id, round_no):
+    """One auto-accepted real-world item per team per round, picked at random (seeded,
+    so the pick is stable) for the instructor to spot-check. Returns the item while
+    it is still un-reviewed, else None. The pick is remembered once made."""
+    key = f"spotcheck:{team_id}:{round_no}"
+    picked = db.get_setting(key)
+    if picked:
+        e = db.get_evidence(team_id, int(picked))
+        return e if e and e.get("review_status") == "Auto-accepted" else None
+    pool = [e for e in db.list_evidence(team_id)
+            if e.get("round") == round_no and e.get("review_status") == "Auto-accepted"
+            and (e.get("origin") in db.REAL_ORIGINS)]
+    if not pool:
+        return None
+    import random as _r
+    choice = _r.Random(f"{team_id}:{round_no}").choice(sorted(pool, key=lambda e: e["id"]))
+    db.set_global_setting(key, choice["id"])
+    return choice
+
+
+def review_queue(team_ids, round_no=None):
+    """Evidence awaiting the instructor, oldest first: everything Pending review or
+    Needs artifact (strength 7+, flagged, near-duplicates, outcome overrides), plus a
+    seeded random spot-check of one auto-accepted item per team for the round."""
     out = []
     for tid in team_ids:
         for e in db.list_evidence(tid):
             if e.get("review_status") in ("Pending review", "Needs artifact"):
                 out.append(e)
+        if round_no is not None:
+            sc = spot_check_item(tid, round_no)
+            if sc is not None:
+                out.append({**sc, "_spot_check": True})
     return sorted(out, key=lambda e: e["id"])
 
 
@@ -1741,9 +1845,14 @@ def refresh_assumption_status(team_id, assum_id):
         new = "Testing" if src == "derived" else cur   # derived result went away
     else:
         return cur                       # Untested / Ignored stay as the team set them
-    if new != cur or src != "derived":
-        db.set_assumption_status(team_id, assum_id, new, "derived",
-                                 "Set automatically from experiment results/evidence")
+    note = "Set automatically from experiment results/evidence"
+    exps = sorted((e for e in db.list_experiments(team_id)
+                   if e["assumption_id"] == assum_id and e["outcome"] in ("Supported", "Refuted")),
+                  key=lambda e: e["id"])
+    if new in ("Supported", "Refuted") and exps and exps[-1].get("simulated"):
+        note = "Set by a SIMULATED test (simulation pathway) — not real-world evidence"
+    if new != cur or src != "derived" or (a.get("status_note") or "") != note:
+        db.set_assumption_status(team_id, assum_id, new, "derived", note)
     return new
 
 
@@ -1850,7 +1959,7 @@ _OUTCOME_DIRECTION = {"Supported": "Supports", "Refuted": "Contradicts",
 
 def record_experiment_result(team_id, exp_id, observed_value=None, observed_n=None,
                              result_text="", learned="", decision="", outcome=None,
-                             override_reason=""):
+                             override_reason="", _simulated=False):
     """Save a Learning Card. With numeric thresholds the outcome is COMPUTED from the
     observed value; choosing a different outcome needs a written reason (and sends
     the resulting evidence to instructor review). A resolved result (Supported,
@@ -1884,6 +1993,8 @@ def record_experiment_result(team_id, exp_id, observed_value=None, observed_n=No
                    "override_reason": override_reason or None}
     if resolved and exp.get("result_round") is None:
         exp_updates["result_round"] = db.current_round()
+    if _simulated:
+        exp_updates["simulated"] = 1
     ev_fields = None
     award = 0.0
     if resolved:
@@ -1897,11 +2008,14 @@ def record_experiment_result(team_id, exp_id, observed_value=None, observed_n=No
                      "justification": (learned or "").strip() or "Pre-registered test result",
                      "sample_n": int(observed_n) if observed_n else None}
         if not exp.get("evidence_id"):
-            auto = strength <= content.EVIDENCE_AUTO_ACCEPT_MAX_STRENGTH and not overridden
+            auto = ((strength <= content.EVIDENCE_AUTO_ACCEPT_MAX_STRENGTH or _simulated)
+                    and not overridden)
             ev_fields.update({
                 "evidence_type": f"Experiment result: {exp['card_type']}", "strength": strength,
-                "source": f"Experiment #{exp_id} (pre-registered test)",
-                "assumption_id": exp["assumption_id"], "origin": "Real-world",
+                "source": (f"Experiment #{exp_id} (SIMULATED run)" if _simulated
+                           else f"Experiment #{exp_id} (pre-registered test)"),
+                "assumption_id": exp["assumption_id"],
+                "origin": "Simulation" if _simulated else "Real-world",
                 "collected_on": _today(),
                 "review_status": "Auto-accepted" if auto else "Pending review",
                 "dedupe_key": f"experiment {exp_id}"})
@@ -1923,6 +2037,68 @@ def record_experiment_result(team_id, exp_id, observed_value=None, observed_n=No
             "Inconclusive": "The result landed between your thresholds — the assumption "
                             "stays 'Testing'. Consider a stronger or better-targeted test."}[outcome]
     return True, f"Learning Card saved as **{outcome}**. {note}"
+
+
+# --------------------------------------------------------------------------- #
+# Instructor-enabled simulation pathway (Venture Foundry's own simulation rule).
+#   For teams that can't reach real customers in time. Each assumption has a hidden
+#   "true" rate drawn once from the team's territory; a simulated run samples n
+#   simulated customers and reports the % who responded. Weak (opinion-style) cards
+#   over-state interest, just as stated intentions do in real life. Results are
+#   labelled SIMULATION everywhere, count toward deliverables, assumption status and
+#   venture value, and never toward the reasoning-quality evidence scores.
+# --------------------------------------------------------------------------- #
+def sim_enabled(team_id):
+    return db.get_setting(f"sim_enabled:{team_id}", "0") == "1"
+
+
+def set_sim_enabled(team_id, on):
+    db.set_global_setting(f"sim_enabled:{team_id}", "1" if on else "0")
+
+
+def _sim_true_rate(team_id, assumption_id):
+    import hashlib
+    import random as _r
+    t = db.get_team(team_id) or {}
+    seed = hashlib.sha256(f"{team_id}:{assumption_id}:{t.get('opportunity', '')}".encode()).hexdigest()
+    return _r.Random(seed).uniform(0.02, 0.40)
+
+
+def card_min_sample(card_name):
+    card = content.EXPERIMENT_CARD_MAP.get(card_name) or {}
+    m = re.search(r"\d+", str(card.get("sample", "")))
+    return int(m.group()) if m else 10
+
+
+def simulate_experiment(team_id, exp_id, n):
+    """Run a SIMULATED version of an experiment with sample size n. Only for teams the
+    instructor enabled; one run per experiment (no re-rolling). The observed value
+    is the % of the simulated sample that responded, so thresholds must be % values.
+    Returns (ok, message)."""
+    if not sim_enabled(team_id):
+        return False, "The simulation pathway isn't enabled for your team (ask your instructor)."
+    exp = next((e for e in db.list_experiments(team_id) if e["id"] == exp_id), None)
+    if not exp:
+        return False, "Experiment not found for your team."
+    if exp.get("observed_value") is not None or exp.get("simulated"):
+        return False, "This experiment already has a result — simulated runs can't be re-rolled."
+    if exp.get("success_value") is None or exp.get("failure_value") is None:
+        return False, "Simulated runs need numeric thresholds (as % values)."
+    n = int(n or 0)
+    lo = card_min_sample(exp["card_type"])
+    if n < lo or n > content.SIM_MAX_SAMPLE:
+        return False, f"Choose a sample between {lo} (this card's minimum) and {content.SIM_MAX_SAMPLE}."
+    import random as _r
+    p = _sim_true_rate(team_id, exp["assumption_id"])
+    if int(exp.get("evidence_strength") or 0) < 5:
+        p = min(0.95, p * 1.35)          # stated interest over-states real behaviour
+    rng = _r.Random(f"sim:{team_id}:{exp_id}")
+    hits = sum(1 for _ in range(n) if rng.random() < p)
+    observed = round(100.0 * hits / n, 1)
+    return record_experiment_result(
+        team_id, exp_id, observed_value=observed, observed_n=n,
+        result_text=f"SIMULATED: {hits} of {n} simulated customers responded ({observed}%).",
+        learned="", decision="", outcome=None, _simulated=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -2011,7 +2187,8 @@ def scored_evidence(team_id):
     evidence that isn't still waiting for review. A self-rated strong claim affects
     nothing until the instructor accepts it (it still counts toward 'log N items')."""
     return [e for e in db.list_counted_evidence(team_id)
-            if e.get("review_status") not in ("Pending review", "Needs artifact")]
+            if e.get("review_status") not in ("Pending review", "Needs artifact")
+            and e.get("origin") in db.REAL_ORIGINS]          # simulated items never score
 
 
 def evidence_summary(team_id):

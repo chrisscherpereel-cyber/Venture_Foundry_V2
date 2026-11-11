@@ -148,8 +148,12 @@ def test_foreign_assumption_cannot_be_linked():
 
 def test_per_round_credit_cap():
     tid = _team(credits=0)
-    for i in range(20):
-        r = logic.log_evidence(tid, f"interview {i} described buying", PAST, f"o{i}", "past")
+    words = ["apples", "bakery", "canteen", "delivery", "espresso", "farmers", "grocer",
+             "hostel", "icecream", "juicebar", "kiosk", "library", "market", "noodles",
+             "orchard", "pantry", "quiche", "ramen", "salads", "tacos"]
+    for i, w in enumerate(words):        # genuinely different items (no near-duplicates)
+        r = logic.log_evidence(tid, f"{w} owner described weekly {w} waste routine", PAST,
+                               f"{w} shop", "past")
         assert r["ok"]
     assert _credits(tid) == content.EVIDENCE_CREDIT_CAP_PER_ROUND
 

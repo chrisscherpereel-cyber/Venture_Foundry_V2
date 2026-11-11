@@ -464,7 +464,8 @@ CREDITS_PER_STRENGTH = 1.0
 # are paid identically — disproving an assumption is as valuable as confirming it.
 EVIDENCE_BASE_CREDIT = 1.0
 EVIDENCE_RELEASE_PER_STRENGTH = 0.5
-EVIDENCE_AUTO_ACCEPT_MAX_STRENGTH = 5      # above this, an instructor reviews the claim
+EVIDENCE_AUTO_ACCEPT_MAX_STRENGTH = 6      # above this, an instructor reviews the claim
+                                           # (sampled review, decided 2026-11-11; was 5)
 EVIDENCE_CREDIT_CAP_PER_ROUND = 30.0       # evidence credits a team can earn per round
 
 EVIDENCE_ORIGINS = ["Real-world", "AI practice"]   # "Simulation" is set only by the app
@@ -479,7 +480,39 @@ ASSUMPTION_ALL_STATUSES = ["Untested", "Testing", "Supported", "Refuted", "Ignor
 # items pointing the same way with at least this much combined strength.
 ASSUMPTION_SETTLE_MIN_ITEMS = 2
 ASSUMPTION_SETTLE_MIN_STRENGTH = 10
-ROUND_RUBRIC_VERSION = "rs-1"            # stored with every finalized round result
+ROUND_RUBRIC_VERSION = "rs-2"            # stored with every finalized round result
+
+# ---- Stage 2: interpretive strength (adapted from Testing Business Ideas' four
+# contrasts for judging evidence: opinions vs facts, say vs do, lab vs real world,
+# small vs large investment). The arithmetic below is Venture Foundry's own rule;
+# students are shown the REASONS, not the numbers (course decision 2026-11-11).
+STRENGTH_DIMENSIONS = [
+    ("fact", "What kind of information is it?",
+     ["Opinion or belief (\"I think…\", \"I would…\")", "Fact about a past event (\"Last week I…\")"],
+     ("opinions or beliefs", "facts about real past events")),
+    ("do", "Did they SAY it or DO it?",
+     ["Something people said", "Something people did (observed or recorded)"],
+     ("what people said", "what people actually did")),
+    ("real", "Where did it happen?",
+     ["A test/lab setting (they knew they were being tested)", "Real-world setting"],
+     ("a test setting where people knew they were observed", "a real-world setting")),
+    ("big", "How much did they commit?",
+     ["Small or no commitment (an email, a like)", "Large commitment (money, reputation, real time)"],
+     ("a small commitment", "a large commitment of money, time or reputation")),
+]
+STRENGTH_SAMPLE_BONUS_N = 5            # sample this size or larger adds a point
+NONBINDING_TYPES = {"Customer signs a letter of intent": 7}   # ceiling: usually not binding
+EVIDENCE_REVIEW_MIN_STRENGTH = EVIDENCE_AUTO_ACCEPT_MAX_STRENGTH + 1   # checked by the instructor
+NEAR_DUPLICATE_SIMILARITY = 0.85       # word-overlap ratio that marks a possible copy
+
+# ---- Stage 2: four-strand grade (course decision 2026-11-11) ----
+GRADE_WEIGHTS = {"reasoning": 60, "completion": 25, "reflection": 15}
+VENTURE_BONUS_TIERS = (5.0, 2.5, 0.0)   # top / middle / bottom third of the section
+REFLECTION_RATINGS = {"Beginning": 60, "Proficient": 85, "Exemplary": 100}
+REFLECTION_SAMPLE_EVERY = 3            # rate 1 entry per student per this many rounds
+
+# ---- Stage 2: instructor-enabled simulation pathway ----
+SIM_MAX_SAMPLE = 200
 
 # --------------------------------------------------------------------------- #
 # Value Proposition Auction

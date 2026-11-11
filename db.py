@@ -559,6 +559,7 @@ def _create_schema(conn, pg):
     _ensure_column(conn, pg, "reflections", "perspective", "TEXT")
     _ensure_column(conn, pg, "reflections", "perspective_note", "TEXT")
     _stage1_schema(conn, pg)
+    _stage2_schema(conn, pg)
 
 
 # --------------------------------------------------------------------------- #
@@ -620,6 +621,30 @@ def _stage1_schema(conn, pg):
         FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE)""")
 
 
+def _stage2_schema(conn, pg):
+    """Stage 2 additive migrations (per-game layout, grading, review, pitch, etc.)."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS game_schedule (
+        game_id INTEGER NOT NULL, round INTEGER NOT NULL, advance_at TEXT,
+        PRIMARY KEY (game_id, round))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS game_round_topics (
+        game_id INTEGER NOT NULL, topic_key TEXT NOT NULL, round INTEGER, position INTEGER,
+        PRIMARY KEY (game_id, topic_key))""")
+    _ensure_column(conn, pg, "evidence", "interpretation", "TEXT")
+    _ensure_column(conn, pg, "evidence", "strength_dims", "TEXT")      # JSON of 4 picks
+    _ensure_column(conn, pg, "evidence", "ladder_strength", "INTEGER") # type's nominal value
+    _ensure_column(conn, pg, "evidence", "strength_reasons", "TEXT")   # JSON list
+    _ensure_column(conn, pg, "evidence", "similar_to", "INTEGER")      # near-duplicate of
+    _ensure_column(conn, pg, "assumptions", "status_history", "TEXT")
+    _ensure_column(conn, pg, "experiments", "simulated", "INTEGER")   # 1 = simulated run
+    _ensure_column(conn, pg, "round_answers", "first_quiz", "TEXT")
+    _ensure_column(conn, pg, "reflections", "assumption_id", "INTEGER")
+    _ensure_column(conn, pg, "reflections", "changed_mind", "TEXT")
+    conn.execute("""CREATE TABLE IF NOT EXISTS reflection_ratings (
+        reflection_id INTEGER PRIMARY KEY, team_id INTEGER NOT NULL, student_name TEXT,
+        round INTEGER, rating TEXT, note TEXT, rated_at TEXT,
+        FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE)""")
+
+
 def _normalize_dedupe(*parts):
     """Normalized key for spotting a re-logged copy of the same evidence."""
     text = " ".join((p or "") for p in parts).lower()
@@ -636,6 +661,17 @@ def _backfill_stage1(conn):
 
 
 def init_db():
+    # Schema setup and first-run seeding are deployment-wide: never run them inside
+    # a (possibly stale) thread-local game context.
+    prev_gid = active_game_id()
+    set_active_game(None)
+    try:
+        _init_db()
+    finally:
+        set_active_game(prev_gid)
+
+
+def _init_db():
     conn = get_conn()
     try:
         if IS_PG:
@@ -691,17 +727,53 @@ def init_db():
 # --------------------------------------------------------------------------- #
 # Settings
 # --------------------------------------------------------------------------- #
+# Settings that belong to a GAME (class section), not the whole deployment. With an
+# active game, reads look for "<key>@g<game id>" first and fall back to the global
+# value (so existing games keep today's behaviour until a Director changes them);
+# writes go to the game's own key. PIN, AI config and backups stay global.
+GAME_SCOPED_KEYS = {
+    "total_rounds", "difficulty", "strict_round_mode", "score_weights",
+    "round_score_config", "grade_config", "auto_run_on_advance", "auto_events_on",
+    "auto_scoring_on", "auto_pivots_on", "auto_feedback_on", "mail_foundry_auto",
+    "mail_mp_auto", "econ_hours_per_week",
+}
+GAME_SCOPED_PREFIXES = ("econ_",)
+
+
+def _scoped(key):
+    return key in GAME_SCOPED_KEYS or key.startswith(GAME_SCOPED_PREFIXES)
+
+
+def scoped_key(key, game_id=None):
+    gid = game_id if game_id is not None else active_game_id()
+    return f"{key}@g{gid}" if (gid and _scoped(key)) else key
+
+
 @run_memo
 def get_setting(key, default=None):
     conn = get_conn()
     try:
+        if _scoped(key) and active_game_id():
+            row = conn.execute("SELECT value FROM settings WHERE key=?",
+                               (scoped_key(key),)).fetchone()
+            if row:
+                return row["value"]
         row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
         return row["value"] if row else default
     finally:
         conn.close()
 
 
+def set_global_setting(key, value):
+    """Write the deployment-wide value (bypasses game scoping)."""
+    _write_setting(key, value)
+
+
 def set_setting(key, value):
+    _write_setting(scoped_key(key), value)
+
+
+def _write_setting(key, value):
     conn = get_conn()
     try:
         conn.execute(
@@ -777,6 +849,8 @@ def delete_game(game_id):
     conn = get_conn()
     try:
         conn.execute("DELETE FROM teams WHERE game_id=?", (game_id,))
+        conn.execute("DELETE FROM game_schedule WHERE game_id=?", (game_id,))
+        conn.execute("DELETE FROM game_round_topics WHERE game_id=?", (game_id,))
         conn.execute("DELETE FROM games WHERE id=?", (game_id,))
         conn.commit()
     finally:
@@ -1237,6 +1311,9 @@ def list_evidence(team_id):
 # Review statuses that take an item OUT of the team's counted evidence.
 EVIDENCE_EXCLUDED_STATUSES = ("Withdrawn", "Duplicate", "Practice")
 REAL_ORIGINS = (None, "", "Real-world")
+# Simulation evidence (instructor-enabled pathway) counts toward deliverables and
+# assumption status — labelled SIM — but never toward reasoning-quality scores.
+COUNTED_ORIGINS = REAL_ORIGINS + ("Simulation",)
 
 
 @run_memo
@@ -1245,7 +1322,7 @@ def list_counted_evidence(team_id):
     items (legacy rows have no origin and count) that weren't withdrawn, marked as a
     duplicate, or logged as AI practice."""
     return [e for e in list_evidence(team_id)
-            if (e.get("origin") in REAL_ORIGINS)
+            if (e.get("origin") in COUNTED_ORIGINS)
             and (e.get("review_status") not in EVIDENCE_EXCLUDED_STATUSES)]
 
 
@@ -1571,9 +1648,17 @@ def set_assumption_status(team_id, assum_id, status, source, note=None):
     """Write an assumption's status with its provenance (team-scoped)."""
     conn = get_conn()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT status, status_history FROM assumptions WHERE id=? AND team_id=?"
+                           + (" FOR UPDATE" if IS_PG else ""), (assum_id, team_id)).fetchone()
+        if not row:
+            conn.rollback()
+            return 0
+        hist = _append_history(row["status_history"], {"from": row["status"], "to": status,
+                                                       "by": source, "note": note or ""})
         cur = conn.execute(
-            "UPDATE assumptions SET status=?, status_source=?, status_note=? "
-            "WHERE id=? AND team_id=?", (status, source, note, assum_id, team_id))
+            "UPDATE assumptions SET status=?, status_source=?, status_note=?, status_history=? "
+            "WHERE id=? AND team_id=?", (status, source, note, hist, assum_id, team_id))
         conn.commit()
         return cur.rowcount
     finally:
@@ -2049,31 +2134,81 @@ def delete_ai_log(log_id):
 # Schedule (round -> topic -> advance datetime). Raw CRUD; higher-level seeding
 # and derived queries live in logic.py.
 # --------------------------------------------------------------------------- #
-@run_memo
-def get_schedule_rows():
+# Per-game copies live in game_schedule / game_round_topics. The first time a game
+# reads its schedule, the deployment-wide rows are copied in (once), so existing
+# games keep their current layout; after that each game's layout is its own.
+def _ensure_game_layout(gid):
+    flag = f"layout_seeded@g{gid}"
     conn = get_conn()
     try:
-        rows = conn.execute("SELECT * FROM schedule ORDER BY round").fetchall()
+        if conn.execute("SELECT 1 FROM settings WHERE key=?", (flag,)).fetchone():
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM settings WHERE key=?" + (" FOR UPDATE" if IS_PG else ""),
+                        (flag,)).fetchone():
+            conn.rollback()
+            return
+        for r in conn.execute("SELECT round, advance_at FROM schedule").fetchall():
+            conn.execute("INSERT OR IGNORE INTO game_schedule(game_id, round, advance_at) "
+                         "VALUES(?,?,?)", (gid, r["round"], r["advance_at"]))
+        for r in conn.execute("SELECT topic_key, round, position FROM round_topics").fetchall():
+            conn.execute("INSERT OR IGNORE INTO game_round_topics(game_id, topic_key, round, "
+                         "position) VALUES(?,?,?,?)", (gid, r["topic_key"], r["round"], r["position"]))
+        conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, '1')", (flag,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _gid_for_layout():
+    gid = active_game_id()
+    if gid:
+        _ensure_game_layout(gid)
+    return gid
+
+
+@run_memo
+def get_schedule_rows():
+    gid = _gid_for_layout()
+    conn = get_conn()
+    try:
+        if gid:
+            rows = conn.execute("SELECT round, NULL AS topic_key, advance_at FROM game_schedule "
+                                "WHERE game_id=? ORDER BY round", (gid,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM schedule ORDER BY round").fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
 def upsert_schedule_row(round_no, topic_key, advance_at=None):
+    gid = _gid_for_layout()
     conn = get_conn()
     try:
-        conn.execute(
-            "INSERT INTO schedule(round, topic_key, advance_at) VALUES(?,?,?) "
-            "ON CONFLICT(round) DO UPDATE SET topic_key=excluded.topic_key, "
-            "advance_at=excluded.advance_at",
-            (round_no, topic_key, advance_at),
-        )
+        if gid:
+            conn.execute(
+                "INSERT INTO game_schedule(game_id, round, advance_at) VALUES(?,?,?) "
+                "ON CONFLICT(game_id, round) DO UPDATE SET advance_at=excluded.advance_at",
+                (gid, round_no, advance_at))
+        else:
+            conn.execute(
+                "INSERT INTO schedule(round, topic_key, advance_at) VALUES(?,?,?) "
+                "ON CONFLICT(round) DO UPDATE SET topic_key=excluded.topic_key, "
+                "advance_at=excluded.advance_at",
+                (round_no, topic_key, advance_at),
+            )
         conn.commit()
     finally:
         conn.close()
 
 
 def set_schedule_topic(round_no, topic_key):
+    if active_game_id():
+        return                       # legacy single-topic column; unused per game
     conn = get_conn()
     try:
         conn.execute("UPDATE schedule SET topic_key=? WHERE round=?", (topic_key, round_no))
@@ -2083,18 +2218,27 @@ def set_schedule_topic(round_no, topic_key):
 
 
 def set_schedule_advance(round_no, advance_at):
+    gid = _gid_for_layout()
     conn = get_conn()
     try:
-        conn.execute("UPDATE schedule SET advance_at=? WHERE round=?", (advance_at, round_no))
+        if gid:
+            conn.execute("UPDATE game_schedule SET advance_at=? WHERE game_id=? AND round=?",
+                         (advance_at, gid, round_no))
+        else:
+            conn.execute("UPDATE schedule SET advance_at=? WHERE round=?", (advance_at, round_no))
         conn.commit()
     finally:
         conn.close()
 
 
 def delete_schedule_rows_above(max_round):
+    gid = _gid_for_layout()
     conn = get_conn()
     try:
-        conn.execute("DELETE FROM schedule WHERE round > ?", (max_round,))
+        if gid:
+            conn.execute("DELETE FROM game_schedule WHERE game_id=? AND round > ?", (gid, max_round))
+        else:
+            conn.execute("DELETE FROM schedule WHERE round > ?", (max_round,))
         conn.commit()
     finally:
         conn.close()
@@ -2105,23 +2249,34 @@ def delete_schedule_rows_above(max_round):
 # --------------------------------------------------------------------------- #
 @run_memo
 def get_round_topics():
+    gid = _gid_for_layout()
     conn = get_conn()
     try:
-        rows = conn.execute(
-            "SELECT topic_key, round, position FROM round_topics "
-            "ORDER BY round, position"
-        ).fetchall()
+        if gid:
+            rows = conn.execute(
+                "SELECT topic_key, round, position FROM game_round_topics WHERE game_id=? "
+                "ORDER BY round, position", (gid,)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT topic_key, round, position FROM round_topics "
+                "ORDER BY round, position"
+            ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
 def next_topic_position(round_no):
+    gid = _gid_for_layout()
     conn = get_conn()
     try:
-        row = conn.execute(
-            "SELECT MAX(position) AS m FROM round_topics WHERE round=?", (round_no,)
-        ).fetchone()
+        if gid:
+            row = conn.execute("SELECT MAX(position) AS m FROM game_round_topics "
+                               "WHERE game_id=? AND round=?", (gid, round_no)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT MAX(position) AS m FROM round_topics WHERE round=?", (round_no,)
+            ).fetchone()
         return (row["m"] + 1) if row and row["m"] is not None else 0
     finally:
         conn.close()
@@ -2131,14 +2286,22 @@ def set_topic_placement(topic_key, round_no, position=None):
     """Place a topic in a round (moves it if already placed elsewhere)."""
     if position is None:
         position = next_topic_position(round_no)
+    gid = _gid_for_layout()
     conn = get_conn()
     try:
-        conn.execute(
-            "INSERT INTO round_topics(topic_key, round, position) VALUES(?,?,?) "
-            "ON CONFLICT(topic_key) DO UPDATE SET round=excluded.round, "
-            "position=excluded.position",
-            (topic_key, round_no, position),
-        )
+        if gid:
+            conn.execute(
+                "INSERT INTO game_round_topics(game_id, topic_key, round, position) "
+                "VALUES(?,?,?,?) ON CONFLICT(game_id, topic_key) DO UPDATE SET "
+                "round=excluded.round, position=excluded.position",
+                (gid, topic_key, round_no, position))
+        else:
+            conn.execute(
+                "INSERT INTO round_topics(topic_key, round, position) VALUES(?,?,?) "
+                "ON CONFLICT(topic_key) DO UPDATE SET round=excluded.round, "
+                "position=excluded.position",
+                (topic_key, round_no, position),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -2146,9 +2309,14 @@ def set_topic_placement(topic_key, round_no, position=None):
 
 def remove_round_topic(topic_key):
     """Unassign a topic (leaves it in the unassigned pool)."""
+    gid = _gid_for_layout()
     conn = get_conn()
     try:
-        conn.execute("DELETE FROM round_topics WHERE topic_key=?", (topic_key,))
+        if gid:
+            conn.execute("DELETE FROM game_round_topics WHERE game_id=? AND topic_key=?",
+                         (gid, topic_key))
+        else:
+            conn.execute("DELETE FROM round_topics WHERE topic_key=?", (topic_key,))
         conn.commit()
     finally:
         conn.close()
