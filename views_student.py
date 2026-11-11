@@ -1153,6 +1153,26 @@ def my_venture(team):
         dashboard(team)
     with t2:
         progress(team)
+    _finalized_scores(team)
+
+
+def _finalized_scores(team):
+    """Past round scores as they were frozen when each round closed (plus any
+    instructor adjustment and its reason)."""
+    cur = db.current_round()
+    if cur <= 1:
+        return
+    with st.expander("🏁 Past round scores (frozen when each round closed)"):
+        st.caption("Each round's score is saved when the round ends, so later work never "
+                   "rewrites it. If your instructor adjusts a score, the reason appears here.")
+        rows = []
+        for r in range(1, cur):
+            rs = logic.round_score(team["id"], r)
+            rows.append({"Round": r, "Score /100": rs["score"], "Grade": rs["grade"],
+                         "Automated": rs.get("auto_score", rs["score"]),
+                         "Adjustment": rs.get("adjustment", 0) or 0,
+                         "Reason": rs.get("adjust_reason") or ""})
+        st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
 def dashboard(team):
@@ -2193,20 +2213,44 @@ def assumptions(team):
             c1.write(f"Importance: {a['importance']}/5")
             c2.write(f"Existing evidence: {a['evidence_level']}/5")
             c3.write(f"Testability: {a['testability']}/5")
+            src = a.get("status_source")
+            src_txt = {"derived": "set automatically from your test results / reviewed evidence",
+                       "instructor": "set by your instructor",
+                       "student": "set by your team", None: "set before automatic statuses existed"
+                       }.get(src, "")
+            st.caption(f"Status **{a['status']}** — {src_txt}."
+                       + (f" Note: {a['status_note']}" if a.get("status_note")
+                          and src == "instructor" else ""))
+            linked = [e for e in db.list_evidence(team["id"])
+                      if e.get("assumption_id") == a["id"]
+                      and e.get("review_status") not in db.EVIDENCE_EXCLUDED_STATUSES]
+            if linked:
+                st.caption("Linked evidence: " + " · ".join(
+                    f"#{e['id']} {e.get('direction') or '?'} ({e['strength']}/10, "
+                    f"{logic.evidence_review_label(e)})" for e in linked[:6]))
+            opts = content.ASSUMPTION_MANUAL_STATUSES
+            locked_status = (src == "instructor"
+                             or (a["status"] in ("Supported", "Refuted") and src == "derived"))
             new_status = st.selectbox(
-                "Status", ["Untested", "Testing", "Supported", "Refuted", "Ignored"],
-                index=["Untested", "Testing", "Supported", "Refuted", "Ignored"].index(a["status"]),
-                key=f"astatus_{a['id']}", disabled=not editable,
-                help="Untested = no evidence yet; Testing = experiment running; "
-                     "Supported/Refuted = evidence came back; Ignored = you chose not to test "
-                     "(risky if it's important).",
+                "Set status", opts,
+                index=opts.index(a["status"]) if a["status"] in opts else 0,
+                key=f"astatus_{a['id']}", disabled=not editable or locked_status,
+                help="You can mark an assumption Untested, Testing, or Ignored. **Supported** "
+                     "and **Refuted** are set automatically when a pre-registered experiment "
+                     "resolves, or when at least "
+                     f"{content.ASSUMPTION_SETTLE_MIN_ITEMS} reviewed evidence items pointing the "
+                     f"same way reach a combined strength of {content.ASSUMPTION_SETTLE_MIN_STRENGTH}. "
+                     "Ignored = you chose not to test (risky if it's important).",
             )
             if editable:
                 cc1, cc2 = st.columns(2)
-                if cc1.button("Update status", key=f"aupd_{a['id']}",
+                if cc1.button("Update status", key=f"aupd_{a['id']}", disabled=locked_status,
                               help="Save the status you selected."):
-                    db.update_assumption(a["id"], status=new_status)
-                    st.rerun()
+                    ok, msg = logic.set_assumption_status_by_team(team["id"], a["id"], new_status)
+                    if ok:
+                        st.rerun()
+                    else:
+                        st.error(msg)
                 if cc2.button("Delete", key=f"adel_{a['id']}",
                               help="Remove this assumption."):
                     db.delete_assumption(a["id"])
@@ -2228,10 +2272,12 @@ def experiments(team):
         steps=[
             "Pick an experiment card and read its cost, strength, and best-fit risk type.",
             "Choose which assumption it tests.",
-            "Write a hypothesis, a metric, and success + failure thresholds.",
+            "Write a hypothesis, a metric, and NUMERIC success + failure thresholds (the gap "
+            "between them is the 'inconclusive' zone).",
             "Write your decision rule (what you'll do for each outcome).",
             "Purchase & design it — resources are deducted and the assumption is marked 'Testing.'",
-            "Run the test in the real world, then record the result and outcome below.",
+            "Run the test in the real world, then enter the observed number on the Learning "
+            "Card — the app compares it to your thresholds and creates the evidence item.",
         ],
         terms=[
             ("Evidence strength", "How convincing this test is, 0–10. Behavior beats opinions."),
@@ -2276,7 +2322,14 @@ def experiments(team):
 
     if editable:
       _ai_ack_popover(team, "Experiment Marketplace", "exp_ai", label=_AI_LOG_LABEL)
-      with st.form("buy_experiment", clear_on_submit=True):
+      # One token per form instance: a double-click or retried submit carries the same
+      # token, so the purchase is charged at most once.
+      if "exp_req_token" not in st.session_state:
+          import secrets as _secrets
+          st.session_state["exp_req_token"] = _secrets.token_hex(8)
+      # Keyed by the token: after a successful purchase the token rotates, giving a fresh,
+      # empty form; after an error the same form (and everything typed) stays.
+      with st.form(f"buy_experiment_{st.session_state['exp_req_token']}", clear_on_submit=False):
         if assums:
             assum_id = st.selectbox(
                 "Assumption tested",
@@ -2300,10 +2353,23 @@ def experiments(team):
         failure = c2.text_input(
             "Failure threshold", placeholder="≤1 requests a trial",
             help="The result that would make you reject the assumption. Set it BEFORE testing.")
+        st.markdown("**📏 Numeric thresholds** — the numbers your metric will be compared "
+                    "against. Between them is the *inconclusive* zone (it won't count as support).")
+        n1, n2, n3 = st.columns([1, 1, 1.3])
+        sv = n1.number_input("Success at (number)", value=None, step=1.0, format="%g",
+                             placeholder="e.g. 5",
+                             help="The metric value at which you'll call the assumption supported.")
+        fv = n2.number_input("Failure at (number)", value=None, step=1.0, format="%g",
+                             placeholder="e.g. 1",
+                             help="The metric value at which you'll call it refuted.")
+        hib = n3.radio("Better is…", ["Higher", "Lower"], horizontal=True,
+                       help="Higher: more is better (sign-ups, payments). Lower: less is better "
+                            "(cost per lead, minutes to complete).")
         decision = st.text_input(
             "Decision rule",
-            placeholder="If supported, build clickable prototype; if refuted, revisit segment",
-            help="What you will actually DO depending on the outcome.")
+            placeholder="If supported, build clickable prototype; if refuted, revisit segment; "
+                        "if inconclusive, run a better-targeted test",
+            help="What you will actually DO for each outcome (supported, refuted, inconclusive).")
         st.markdown("**🔮 Predict before you run it** — commit to a forecast now; you'll compare "
                     "it to reality afterward. Making and checking predictions is how founders "
                     "build judgment (and catch their own overconfidence).")
@@ -2322,21 +2388,30 @@ def experiments(team):
         if submitted:
             if assum_id is None:
                 st.error("Add an assumption to test first (Assumption Map page).")
-            elif not hypothesis or not success or not failure:
-                st.error("Hypothesis, success threshold, and failure threshold are required.")
+            elif not hypothesis or not success or not failure or not (metric or "").strip():
+                st.error("Hypothesis, metric, and success + failure thresholds are required. "
+                         "Your entries are still in the form.")
+            elif logic.validate_thresholds(sv, fv, hib == "Higher"):
+                st.error(logic.validate_thresholds(sv, fv, hib == "Higher"))
             else:
                 ok, msg, _ = logic.purchase_experiment(
                     team["id"], card, assum_id, hypothesis, metric, success, failure, decision,
-                    predicted_outcome=predicted, confidence=int(confidence))
+                    predicted_outcome=predicted, confidence=int(confidence),
+                    success_value=float(sv), failure_value=float(fv),
+                    higher_is_better=(hib == "Higher"),
+                    request_key=st.session_state["exp_req_token"])
                 if ok:
-                    db.update_assumption(assum_id, status="Testing")
-                    st.success(msg)
+                    st.session_state.pop("exp_req_token", None)   # next form = new purchase
+                    st.session_state["_exp_flash"] = msg
                     st.rerun()
                 else:
-                    st.error(msg)
+                    st.error(msg + " Your entries are still in the form.")
 
     st.divider()
     st.write("### Your experiments")
+    _flash = st.session_state.pop("_exp_flash", None)
+    if _flash:
+        st.success(_flash)
     st.caption("Run each test in the real world, then come back and record what happened.")
 
     # Calibration scoreboard — forecast vs. reality across resolved experiments.
@@ -2386,7 +2461,24 @@ def experiments(team):
                 elif pc is False:
                     st.error(f"❌ Reality disagreed — you predicted **{e['predicted_outcome']}** but "
                              f"the outcome was **{e['outcome']}**. That gap is the lesson.")
-            if not editable:
+            has_nums = e.get("success_value") is not None and e.get("failure_value") is not None
+            if has_nums:
+                better = "higher" if (e.get("higher_is_better") is None
+                                      or e.get("higher_is_better")) else "lower"
+                st.write(f"**Numeric thresholds:** success at {e['success_value']:g}, failure at "
+                         f"{e['failure_value']:g} ({better} is better); in between = inconclusive.")
+            locked = logic.experiment_locked(e)
+            if e.get("observed_value") is not None:
+                st.write(f"**Observed value:** {e['observed_value']:g}"
+                         + (f" (n={e['observed_n']})" if e.get("observed_n") else "")
+                         + (f" · computed: **{e['computed_outcome']}**" if e.get("computed_outcome") else ""))
+            if e.get("override_reason"):
+                st.caption(f"Outcome overridden: {e['override_reason']}")
+            if e.get("evidence_id"):
+                st.caption(f"📒 Logged to your Evidence Ledger as item #{e['evidence_id']}.")
+            if not editable or locked:
+                if locked:
+                    st.caption("🔒 This result was recorded in an earlier round and is locked.")
                 st.write(f"**Observed:** {e['result'] or '_(not recorded)_'}")
                 if e.get("learned"):
                     st.write(f"**Learned:** {e['learned']}")
@@ -2397,36 +2489,55 @@ def experiments(team):
             st.markdown("**🃏 Learning Card** — capture the result as a decision, not just a note.")
             st.caption(f"We believed: *{e['hypothesis']}*  ·  We tested with: *{e['card_type']}*  "
                        f"·  measuring *{e['metric']}* (success: {e['success_threshold'] or '—'}).")
+            ov1, ov2 = st.columns(2)
+            obs = ov1.number_input(
+                "Observed value of your metric", value=e.get("observed_value"), step=1.0,
+                format="%g", key=f"obs_{e['id']}", placeholder="the number you measured",
+                help="The measured number for your metric. With numeric thresholds, the app "
+                     "computes the outcome from this.")
+            obs_n = ov2.number_input("Sample size (n)", min_value=0, step=1,
+                                     value=int(e.get("observed_n") or 0), key=f"obsn_{e['id']}")
             result = st.text_area(
-                "Observed — the measured result", value=e["result"] or "", key=f"res_{e['id']}",
-                help="The numbers/behavior you actually saw. Compare it to your thresholds.")
+                "Observed — what happened", value=e["result"] or "", key=f"res_{e['id']}",
+                help="The numbers/behavior you actually saw, in words. Compare to your thresholds.")
             learned = st.text_area(
                 "Learned — the insight", value=e.get("learned") or "", key=f"learn_{e['id']}",
                 help="What does this evidence tell you about the assumption and the model?")
+            computed = logic.compute_outcome(e, obs)
+            outcomes = ["Designed", "Running", "Supported", "Refuted", "Inconclusive"]
+            default_out = computed or e["outcome"]
             oc1, oc2 = st.columns(2)
             outcome = oc1.selectbox(
-                "Outcome", ["Designed", "Running", "Supported", "Refuted", "Inconclusive"],
-                index=["Designed", "Running", "Supported", "Refuted", "Inconclusive"].index(e["outcome"]),
-                key=f"outc_{e['id']}",
-                help="Compare the result to your thresholds. Supported/Refuted will auto-update "
-                     "the linked assumption. Inconclusive = the test didn't settle it.")
+                "Outcome", outcomes, index=outcomes.index(default_out),
+                key=f"outc_{e['id']}_{computed or 'manual'}",
+                help="With numeric thresholds this is preset from your observed value. Choosing "
+                     "something else needs a reason (and sends the result to instructor review). "
+                     "Inconclusive keeps the assumption at 'Testing'.")
+            if computed:
+                st.caption(f"Your thresholds say: **{computed}**.")
+            override = ""
+            if computed and outcome in ("Supported", "Refuted", "Inconclusive") and outcome != computed:
+                override = st.text_input("Why does the outcome differ from your thresholds?",
+                                         key=f"ovr_{e['id']}")
+            decisions = ["—", "Persevere (keep this belief)", "Pivot (change the model)",
+                         "Run a stronger test", "Stop / drop this idea"]
             decision = oc2.selectbox(
-                "Decide — next action",
-                ["—", "Persevere (keep this belief)", "Pivot (change the model)",
-                 "Run a stronger test", "Stop / drop this idea"],
-                index=(["—", "Persevere (keep this belief)", "Pivot (change the model)",
-                        "Run a stronger test", "Stop / drop this idea"].index(e["decision"])
-                       if e.get("decision") in ["Persevere (keep this belief)", "Pivot (change the model)",
-                                                "Run a stronger test", "Stop / drop this idea"] else 0),
+                "Decide — next action", decisions,
+                index=(decisions.index(e["decision"]) if e.get("decision") in decisions else 0),
                 key=f"dec_{e['id']}", help="What will you DO because of this evidence?")
             if st.button("Save Learning Card", key=f"saveres_{e['id']}",
-                         help="Store the result, insight, and decision; updates the linked assumption."):
-                db.update_experiment(e["id"], result=result, outcome=outcome,
-                                     learned=learned, decision=("" if decision == "—" else decision))
-                if e["assumption_id"] and outcome in ("Supported", "Refuted"):
-                    db.update_assumption(e["assumption_id"], status=outcome)
-                st.success("Saved.")
-                st.rerun()
+                         help="Stores the result, creates its evidence item, and updates the "
+                              "linked assumption."):
+                ok, msg = logic.record_experiment_result(
+                    team["id"], e["id"], observed_value=obs,
+                    observed_n=int(obs_n) if obs_n else None, result_text=result,
+                    learned=learned, decision=("" if decision == "—" else decision),
+                    outcome=outcome, override_reason=override)
+                if ok:
+                    st.session_state["_exp_flash"] = msg
+                    st.rerun()
+                else:
+                    st.error(msg)
 
 
 # --------------------------------------------------------------------------- #
@@ -2463,15 +2574,17 @@ def evidence(team):
     _ai_check_notice(team, tool_area="Other")
     _guide(
         "This is your proof file and your income source. Every time you gather real evidence, "
-        "log it here. The simulation pays you Evidence Credits equal to the evidence's strength "
-        "on the ladder below — so a signed letter of intent (9) is worth far more than a "
-        "friend saying 'cool idea' (1). Behavior beats opinion.",
+        "log it here. You earn a small credit for logging a complete item, and more when it's "
+        "accepted — the stronger the evidence, the more it's worth, so a real commitment "
+        "outweighs a friend saying 'cool idea'. Behavior beats opinion, and evidence that "
+        "DISPROVES an assumption is worth exactly as much as evidence that confirms it.",
         steps=[
             "Open the ladder below to see how evidence is valued.",
-            "Describe what you learned in one line.",
-            "Pick the evidence type that matches HOW you learned it.",
-            "Add the source and optionally link it to an assumption.",
-            "Log it — you're paid credits automatically based on strength.",
+            "Say whether it's real-world evidence or AI practice.",
+            "Describe what you observed in one line — facts, numbers, or a quote.",
+            "Pick the evidence type that matches HOW you learned it, and justify it.",
+            "Link it to an assumption and say whether it supports, contradicts, or is inconclusive.",
+            "Log it — strong or flagged items are released after your instructor reviews them.",
         ],
         terms=[
             ("Behavioral evidence", "Based on what customers DID (bought, signed, tried). "
@@ -2479,6 +2592,8 @@ def evidence(team):
             ("Opinion evidence", "Based on what people SAID they might do. Strength 0–2, "
              "easy to get but weak."),
             ("Evidence Credits", "Currency you earn here and spend on experiments and pivots."),
+            ("In review", "Strong (behavioral) or flagged items: your instructor checks them "
+             "before their full credit is released."),
         ],
     )
 
@@ -2487,93 +2602,175 @@ def evidence(team):
 
     _mom_test_coach()
 
+    with st.expander("💳 How evidence earns credits (and why some items wait for review)"):
+        st.caption(
+            f"Logging a complete **real-world** item pays **{content.EVIDENCE_BASE_CREDIT:g} credit** "
+            f"right away. Its full value (strength × {content.EVIDENCE_RELEASE_PER_STRENGTH:g}) is "
+            f"released when it's accepted — automatically for items of strength "
+            f"{content.EVIDENCE_AUTO_ACCEPT_MAX_STRENGTH} or less whose wording isn't flagged, "
+            "and by your instructor for stronger (behavioral) claims or flagged wording. "
+            "**Evidence that contradicts an assumption earns exactly the same as evidence that "
+            "supports it** — finding out you were wrong is real progress. Re-logging the same "
+            "item earns nothing, and evidence credits are capped at "
+            f"{content.EVIDENCE_CREDIT_CAP_PER_ROUND:g} per round. **AI-practice** material "
+            "(practice interviews, personas) can be saved for rehearsal but never counts as "
+            "customer evidence.")
+
     assums = db.list_assumptions(team["id"])
     # Inputs live OUTSIDE a form so the misclassification check updates as you type —
-    # the point is to make you weigh "behavior vs opinion" before you log.
+    # the point is to make you weigh "behavior vs opinion" before you log. Values stay
+    # in session_state, so a validation error never wipes what you typed.
     if editable:
         _hdr, _aicol = st.columns([8, 1])
         _hdr.write("### Log a piece of evidence")
         with _aicol:
             _ai_ack_popover(team, "Evidence Ledger", "ev_ai")
+        origin = st.radio(
+            "Where did this come from?", content.EVIDENCE_ORIGINS, key="ev_origin",
+            horizontal=True,
+            help="Real-world = something a real person said or did that you observed or "
+                 "recorded. AI practice = output from an AI persona or practice interview — "
+                 "saved for rehearsal only; it earns nothing and can't support an assumption.")
+        practice = origin == "AI practice"
         description = st.text_input(
-            "What did you learn? (one line)", key="ev_desc",
+            "What did you observe? (one line of facts, numbers, or a quote)", key="ev_desc",
             placeholder="3 of 5 shop owners asked to join a paid pilot.",
-            help="A short factual summary of the evidence, not your interpretation.")
+            help="A short factual summary of what happened — not your interpretation.")
         etype = st.selectbox(
             "Evidence type", [lbl for lbl, _ in content.EVIDENCE_LADDER], key="ev_type",
-            help="Choose based on HOW you learned it. Higher on the list = stronger = more "
-                 "credits. Be honest: a hallway 'sounds good' is an opinion, not behavior.")
-        source = st.text_input(
-            "Source", key="ev_src", placeholder="e.g., Interview with 3 coffee-shop owners",
-            help="Where the evidence came from — who, how many, and when.")
+            help="Choose based on HOW you learned it. Higher on the list = stronger. Be honest: "
+                 "a hallway 'sounds good' is an opinion, not behavior. A letter of intent is "
+                 "usually NOT binding — rate it for what was actually committed.")
+        c1, c2, c3 = st.columns([3, 1.4, 1])
+        source = c1.text_input(
+            "Who / context", key="ev_src", placeholder="e.g., 3 independent coffee-shop owners, Flagstaff",
+            help="Who the evidence came from (role or segment — no full names needed) and the context.")
+        collected = c2.date_input("Collected on", key="ev_date",
+                                  help="When the evidence was gathered (not when you're logging it).")
+        n_val = c3.number_input("Sample n", min_value=0, step=1, key="ev_n",
+                                help="How many people/observations this covers (0 = not countable).")
         justification = st.text_input(
             "Why is this that strength? (behavior vs. opinion)", key="ev_just",
             placeholder="They physically pre-paid a $20 deposit — that's an action, not a "
                         "stated intention.",
-            help="Required. In one line, justify the strength you picked. Naming what the "
-                 "customer DID (vs. said) is how you learn to tell strong evidence from weak.")
-        strength = content.EVIDENCE_LADDER_MAP.get(etype, 0)
-        st.caption(f"Selected strength: **{strength}/10** → "
-                   f"{'behavioral (what they did)' if strength >= 6 else 'opinion/intention (what they said)' if strength <= 2 else 'mid-ladder'}")
+            help="Required. Name what the customer DID (vs. said).")
+        limitations = st.text_input(
+            "Limitations (optional)", key="ev_lim",
+            placeholder="Only one hall; collected during exam week.",
+            help="Sample, bias, or relevance limits a skeptical reader would point out.")
+        strength = 0 if practice else content.EVIDENCE_LADDER_MAP.get(etype, 0)
+        if practice:
+            st.caption("🧪 **AI practice** — saved for rehearsal; strength 0, no credit, no "
+                       "assumption link.")
+        else:
+            auto = strength <= content.EVIDENCE_AUTO_ACCEPT_MAX_STRENGTH
+            st.caption(f"Selected strength: **{strength}/10** → "
+                       f"{'behavioral (what they did)' if strength >= 6 else 'opinion/intention (what they said)' if strength <= 2 else 'mid-ladder'}"
+                       f" · pays **{content.EVIDENCE_BASE_CREDIT:g}** now"
+                       + (f" + **{logic.evidence_release(strength):g}** on auto-acceptance"
+                          if auto else f", **{logic.evidence_release(strength):g}** more after "
+                                       "instructor review"))
 
         # Live misclassification nudge — compares your wording to the strength you chose.
-        flags = logic.evidence_flags(description, source, strength) if description else []
+        flags = [] if practice else (logic.evidence_flags(description, source, strength)
+                                     if description else [])
         for f in flags:
-            st.warning("🔎 " + f)
+            st.warning("🔎 " + f + " *(Flagged items go to instructor review instead of "
+                       "auto-acceptance. This check is a wording heuristic — it can be wrong.)*")
 
-        if assums:
+        assum_id, direction = None, None
+        if assums and not practice:
             assum_id = st.selectbox(
                 "Related assumption (optional)",
                 [None] + [a["id"] for a in assums], key="ev_assum",
                 format_func=lambda i: "—" if i is None else next(a["text"] for a in assums if a["id"] == i),
-                help="Link this evidence to the assumption it supports or challenges.")
-        else:
-            assum_id = None
+                help="Link this evidence to the assumption it bears on.")
+            if assum_id is not None:
+                direction = st.radio(
+                    "For that assumption, this evidence…", content.EVIDENCE_DIRECTIONS,
+                    key="ev_dir", horizontal=True, index=None,
+                    help="Supports = makes it more likely true. Contradicts = makes it less "
+                         "likely. Inconclusive = doesn't settle it either way. Contradicting "
+                         "evidence earns the same credit as supporting evidence.")
 
         can_log = bool(description.strip()) and bool(justification.strip())
         if not can_log:
-            st.caption("Enter a one-line learning **and** a justification to log.")
+            st.caption("Enter what you observed **and** a justification to log.")
         if st.button("Log evidence", type="primary", disabled=not can_log,
-                     help="Records the evidence and pays you credits equal to its strength."):
-            award, strn = logic.log_evidence_and_award(
-                team["id"], description, etype, source, assum_id, justification)
-            msg = f"Logged. Strength {strn}/10 → earned {award} Evidence Credits."
-            if flags:
-                st.warning(msg + " (Heads up: it was flagged for a possible strength mismatch — "
-                                  "your instructor can see the flag too.)")
+                     help="Records the evidence and pays the base credit now."):
+            res = logic.log_evidence(
+                team["id"], description, etype, source, justification,
+                assumption_id=assum_id, direction=direction, origin=origin,
+                collected_on=collected.isoformat() if collected else None,
+                sample_n=int(n_val) if n_val else None, limitations=limitations)
+            if res["ok"]:
+                for k in ("ev_desc", "ev_src", "ev_just", "ev_lim", "ev_n", "ev_dir"):
+                    st.session_state.pop(k, None)
+                st.session_state["_ev_flash"] = (
+                    "warning" if res["pending"] or res["flags"] else "success", res["message"])
+                st.rerun()
             else:
-                st.success(msg)
-            for k in ("ev_desc", "ev_src", "ev_just"):
-                st.session_state.pop(k, None)
-            st.rerun()
+                st.error(res["message"])        # inputs are kept so nothing is lost
+    flash = st.session_state.pop("_ev_flash", None)
+    if flash:
+        (st.warning if flash[0] == "warning" else st.success)(flash[1])
 
     st.divider()
     esum = logic.evidence_summary(team["id"])
     ev = db.list_evidence(team["id"])
-    flagged = sum(1 for e in ev
-                  if logic.evidence_flags(e["description"], e["source"], e["strength"]))
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Items", esum["count"], help="Total pieces of evidence logged.")
+    counted = {e["id"] for e in db.list_counted_evidence(team["id"])}
+    flagged = sum(1 for e in ev if e["id"] in counted
+                  and logic.evidence_flags(e["description"], e["source"], e["strength"]))
+    pending = sum(1 for e in ev if e.get("review_status") in ("Pending review", "Needs artifact"))
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Items", esum["count"], help="Counted evidence (real-world, not withdrawn, "
+                                            "not duplicates, not AI practice).")
     c2.metric("Avg strength", esum["avg_strength"],
-              help="Average strength of your evidence. Aim to raise this over time.")
+              help="Average strength of your counted evidence.")
     c3.metric("Behavioral", esum["behavioral"], help="Evidence of strength 6+ (what people did).")
     c4.metric("Opinion-only", esum["opinion"], help="Weak evidence of strength ≤2 (what people said).")
-    c5.metric("⚠️ Flagged", flagged,
-              help="Items whose wording may not match the strength you chose. Open the list "
-                   "below to review and re-log if needed.")
+    c5.metric("⏳ In review", pending, help="Waiting for your instructor (or for an artifact "
+                                           "they asked for).")
+    c6.metric("⚠️ Flagged", flagged,
+              help="Items whose wording may not match the strength you chose (a heuristic).")
 
     if ev:
         st.write("### Your evidence")
+        st.caption("Logged the wrong thing? **Withdraw** an item to return its credits, then "
+                   "log a corrected one. Every change is kept in the item's history.")
         for e in ev:
-            efl = logic.evidence_flags(e["description"], e["source"], e["strength"])
-            icon = "⚠️" if efl else "•"
-            with st.expander(f"{icon} [{e['strength']}/10] {e['description'][:70]}"):
-                st.write(f"**Type:** {e['evidence_type']}  ·  **Credits:** {e['credits_award']}")
-                st.write(f"**Source:** {e['source'] or '—'}")
+            efl = (logic.evidence_flags(e["description"], e["source"], e["strength"])
+                   if e["id"] in counted else [])
+            status = logic.evidence_review_label(e)
+            icon = ("🧪" if (e.get("origin") or "") == "AI practice" else
+                    "⏳" if status in ("Pending review", "Needs artifact") else
+                    "✖️" if status in ("Withdrawn", "Duplicate") else "⚠️" if efl else "•")
+            dirn = f" · {e['direction']}" if e.get("direction") else ""
+            with st.expander(f"{icon} [{e['strength']}/10] {e['description'][:70]}{dirn}"):
+                st.write(f"**Type:** {e['evidence_type']}  ·  **Credits:** {e['credits_award']}"
+                         f"  ·  **Status:** {status}")
+                st.write(f"**Who / context:** {e['source'] or '—'}"
+                         + (f"  ·  **Collected:** {e['collected_on']}" if e.get("collected_on") else "")
+                         + (f"  ·  **n =** {e['sample_n']}" if e.get("sample_n") else ""))
+                if e.get("assumption_id"):
+                    at = next((a["text"] for a in assums if a["id"] == e["assumption_id"]), "")
+                    st.write(f"**Assumption:** {at} — *{e.get('direction') or 'direction not stated'}*")
                 if e.get("justification"):
                     st.write(f"**Why this strength:** {e['justification']}")
+                if e.get("limitations"):
+                    st.write(f"**Limitations:** {e['limitations']}")
+                if e.get("review_note"):
+                    st.info(f"Instructor note: {e['review_note']}")
                 for f in efl:
                     st.warning("🔎 " + f)
+                if (editable and e.get("review_status")
+                        and e["review_status"] not in ("Withdrawn", "Duplicate")):
+                    if st.button("↩️ Withdraw this item", key=f"ev_wd_{e['id']}",
+                                 help="Retract it (e.g. mislabelled). Its credits are returned."):
+                        ok, msg, _ = logic.withdraw_evidence(team["id"], e["id"])
+                        (st.success if ok else st.error)(msg)
+                        if ok:
+                            st.rerun()
 
 
 # --------------------------------------------------------------------------- #

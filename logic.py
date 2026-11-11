@@ -321,9 +321,9 @@ def _deliverable_done(team_id, check, rnd):
     if check == "env_ge_1":
         return len(db.list_canvases(team_id, "environment")) >= 1
     if check == "evidence_ge_2":
-        return len(db.list_evidence(team_id)) >= 2
+        return len(db.list_counted_evidence(team_id)) >= 2
     if check == "evidence_ge_4":
-        return len(db.list_evidence(team_id)) >= 4
+        return len(db.list_counted_evidence(team_id)) >= 4
     if check == "vps_ge_3":
         return len(db.list_value_props(team_id)) >= 3
     if check == "vp_results_ge_1":
@@ -1026,6 +1026,10 @@ def on_round_change(new_round):
         return
     rounds_passed = new_round - marker
     for t in db.list_teams():   # active game's teams (or all, if no game context)
+        # Freeze each finished round's score FIRST, from the work as it stands at the
+        # moment the round closes (idempotent: an existing frozen row is never replaced).
+        for r in range(marker, new_round):
+            finalize_round_result(t["id"], r, source="advance")
         # snapshot each finished round's learning metrics BEFORE applying new learning,
         # so the team can see its progress trend over time.
         for r in range(marker, new_round):
@@ -1194,6 +1198,14 @@ def pre_advance_checklist(round_no=None):
                       "detail": f"{have}/{n} teams have a Round {rnd} event.",
                       "required": False})
 
+    # 4b) Evidence waiting for review (releases credit before the round is frozen)
+    waiting = len(review_queue([t["id"] for t in teams]))
+    items.append({"label": "Evidence reviewed",
+                  "ok": waiting == 0,
+                  "detail": (f"{waiting} item(s) waiting on Evidence Review." if waiting
+                             else "Nothing waiting for review."),
+                  "required": False})
+
     # 5) Round mail
     gid = db.active_game_id()
     f_sent = db.get_setting(_mail_sent_flag(gid, rnd, "foundry"), "0") == "1"
@@ -1336,12 +1348,16 @@ def commitment_state(team_id, rnd):
 
 
 def editing_locked(team_id, rnd=None):
-    """True when the team's work is frozen for the round — i.e. they've committed.
+    """True when the team's work is frozen for the round: they've committed, OR the
+    round's decision deadline has passed (committed or not).
 
     While committed, every tool is view-only so a team can't quietly change committed
-    work and forget to re-commit. Withdrawing (before the deadline) unlocks editing."""
+    work and forget to re-commit. Withdrawing (before the deadline) unlocks editing.
+    After the deadline nobody can edit that round's work; the next round opens when
+    the schedule (or the Director) advances."""
     rnd = db.current_round() if rnd is None else rnd
-    return commitment_state(team_id, rnd)["committed"]
+    st_ = commitment_state(team_id, rnd)
+    return st_["committed"] or st_["locked"]
 
 
 def commit_round(team_id, rnd):
@@ -1426,55 +1442,465 @@ def evidence_flags(description, source, strength):
     return flags
 
 
+# --------------------------------------------------------------------------- #
+# Stage 1 evidence model — origin, direction, review-gated credit.
+#   These are Venture Foundry's own simulation rules (constants in content.py),
+#   not rules prescribed by the source books. The wording flags above remain a
+#   COACHING heuristic: they never change credits directly; they only route an
+#   item to instructor review instead of auto-acceptance.
+# --------------------------------------------------------------------------- #
+QUALIFIED_STATUSES = ("Auto-accepted", "Accepted", "Downgraded")
+
+
+def evidence_release(strength):
+    """Credits released when an item of this strength is accepted (beyond the base)."""
+    return round(max(0, strength or 0) * content.EVIDENCE_RELEASE_PER_STRENGTH, 1)
+
+
+def evidence_is_qualified(e):
+    """Counts toward settling an assumption: real-world and accepted (auto or by review)."""
+    return (e.get("origin") in db.REAL_ORIGINS) and e.get("review_status") in QUALIFIED_STATUSES
+
+
+def evidence_review_label(e):
+    """Short label for an item's review state (legacy rows have none)."""
+    if (e.get("origin") or "") == "AI practice":
+        return "Practice (not evidence)"
+    return e.get("review_status") or "Legacy (pre-review)"
+
+
+def _today():
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def log_evidence(team_id, description, evidence_type, source, justification,
+                 assumption_id=None, direction=None, origin="Real-world",
+                 collected_on=None, sample_n=None, limitations=None):
+    """Validate and log one evidence item; pay its credit per the Stage 1 rules.
+
+    Returns a dict: ok, message, evidence_id, paid, status, pending, flags, strength.
+    Real-world items pay EVIDENCE_BASE_CREDIT at once. Items at or below
+    EVIDENCE_AUTO_ACCEPT_MAX_STRENGTH with no wording flag are auto-accepted and
+    also receive their release; stronger or flagged items wait for review.
+    AI-practice items are stored for rehearsal only: no credit, no assumption link."""
+    description = (description or "").strip()
+    justification = (justification or "").strip()
+    out = {"ok": False, "evidence_id": None, "paid": 0, "status": None, "pending": False,
+           "flags": [], "strength": 0}
+    if not description:
+        out["message"] = "Describe what you observed (one line of facts, numbers or a quote)."
+        return out
+    if not justification:
+        out["message"] = "Add the one-line justification: why is this that strength?"
+        return out
+    if origin not in content.EVIDENCE_ORIGINS:
+        out["message"] = "Choose where this came from: Real-world or AI practice."
+        return out
+    if evidence_type not in content.EVIDENCE_LADDER_MAP:
+        out["message"] = "Pick an evidence type from the ladder."
+        return out
+    practice = origin == "AI practice"
+    if practice and assumption_id is not None:
+        out["message"] = ("AI-practice material can't be linked to an assumption — it is "
+                          "rehearsal, not customer evidence. Remove the link or log real evidence.")
+        return out
+    if assumption_id is not None and direction not in content.EVIDENCE_DIRECTIONS:
+        out["message"] = ("Say whether this supports, contradicts, or is inconclusive for the "
+                          "linked assumption.")
+        return out
+    strength = 0 if practice else content.EVIDENCE_LADDER_MAP[evidence_type]
+    flags = [] if practice else evidence_flags(description, source, strength)
+    if practice:
+        status, award = "Practice", 0.0
+    elif strength <= content.EVIDENCE_AUTO_ACCEPT_MAX_STRENGTH and not flags:
+        status = "Auto-accepted"
+        award = content.EVIDENCE_BASE_CREDIT + evidence_release(strength)
+    else:
+        status, award = "Pending review", content.EVIDENCE_BASE_CREDIT
+    fields = {
+        "description": description, "evidence_type": evidence_type, "strength": strength,
+        "source": (source or "").strip(), "assumption_id": assumption_id,
+        "justification": justification, "origin": origin,
+        "direction": direction if assumption_id is not None else None,
+        "collected_on": collected_on or _today(),
+        "sample_n": int(sample_n) if sample_n else None,
+        "limitations": (limitations or "").strip() or None,
+        "review_status": status,
+        "dedupe_key": db._normalize_dedupe(description, source),
+    }
+    rnd = db.current_round()
+    kind, val, paid = db.insert_evidence_tx(team_id, fields, award,
+                                            content.EVIDENCE_CREDIT_CAP_PER_ROUND, rnd)
+    if kind == "duplicate":
+        out["message"] = (f"This looks like a copy of evidence item #{val} already in your "
+                          "ledger, so it wasn't logged again (and no credits were paid). If it "
+                          "is genuinely new, describe what's different about it.")
+        out["evidence_id"] = val
+        out["status"] = "duplicate"
+        return out
+    if kind == "error":
+        out["message"] = val
+        return out
+    out.update({"ok": True, "evidence_id": val, "paid": paid, "status": status,
+                "pending": status == "Pending review", "flags": flags, "strength": strength})
+    if practice:
+        out["message"] = "Saved as AI practice — useful rehearsal, but it earns no credit."
+    elif status == "Pending review":
+        out["message"] = (f"Logged. +{paid} credit now; +{evidence_release(strength)} more is "
+                          "released when your instructor accepts it.")
+    else:
+        out["message"] = f"Logged and accepted. +{paid} Evidence Credits."
+    if paid < award and not practice:
+        out["message"] += (f" (This round's evidence-credit cap of "
+                           f"{content.EVIDENCE_CREDIT_CAP_PER_ROUND:.0f} limited the payout.)")
+    if assumption_id is not None:
+        refresh_assumption_status(team_id, assumption_id)
+    return out
+
+
 def log_evidence_and_award(team_id, description, evidence_type, source,
-                           assumption_id=None, justification=None):
-    """Add evidence to the ledger and pay Evidence Credits for it.
+                           assumption_id=None, justification=None, direction=None):
+    """Backward-compatible wrapper around log_evidence. Returns (credits_paid, strength)."""
+    res = log_evidence(team_id, description, evidence_type, source,
+                       justification or "(no justification given)",
+                       assumption_id=assumption_id,
+                       direction=direction or ("Supports" if assumption_id else None))
+    return res["paid"], res["strength"]
 
-    Behavioral evidence is worth more, so credits scale with ladder strength.
-    Returns (credits_awarded, strength).
-    """
-    strength = content.EVIDENCE_LADDER_MAP.get(evidence_type, 0)
-    award = credits_for_evidence(strength)
-    db.add_evidence(team_id, description, evidence_type, strength, source,
-                    assumption_id, award, justification)
-    if award > 0:
-        db.adjust_resources(
-            team_id, credits=award, kind="evidence",
-            description=f"Evidence logged: {evidence_type}", allow_negative=True,
-        )
-    return award, strength
+
+REVIEW_ACTIONS = ("accept", "downgrade", "needs_artifact", "duplicate", "reopen")
+
+
+def _review_target(row, others, base_strength):
+    base = content.EVIDENCE_BASE_CREDIT
+    room = max(0.0, content.EVIDENCE_CREDIT_CAP_PER_ROUND - others)
+    return min(base + evidence_release(base_strength), room)
+
+
+def review_evidence(team_id, evidence_id, action, reason="", new_type=None, actor="Director"):
+    """Instructor review of one evidence item. Settles its credits so the item's total
+    award matches the decision (idempotent). Legacy (pre-review) and practice items
+    are not reviewable here. Returns (ok, message, credit_delta)."""
+    if action not in REVIEW_ACTIONS:
+        return False, "Unknown review action.", 0
+    if action == "downgrade" and new_type not in content.EVIDENCE_LADDER_MAP:
+        return False, "Choose the evidence type it should have been.", 0
+    if action in ("downgrade", "duplicate", "needs_artifact") and not (reason or "").strip():
+        return False, "Add a short reason the team will see.", 0
+
+    def decide(row, others):
+        st0 = row.get("review_status")
+        if st0 is None:
+            raise _ReviewRefused("Legacy items logged before reviews existed keep their "
+                                 "original credits and aren't re-reviewed.")
+        if st0 in ("Practice", "Withdrawn"):
+            raise _ReviewRefused(f"This item is {st0.lower()} and can't be reviewed.")
+        base = content.EVIDENCE_BASE_CREDIT
+        room = max(0.0, content.EVIDENCE_CREDIT_CAP_PER_ROUND - others)
+        if action == "accept":
+            target, upd = _review_target(row, others, row["strength"]), {"review_status": "Accepted"}
+        elif action == "downgrade":
+            ns = content.EVIDENCE_LADDER_MAP[new_type]
+            target = _review_target(row, others, ns)
+            upd = {"review_status": "Downgraded", "evidence_type": new_type, "strength": ns}
+        elif action == "needs_artifact":
+            target, upd = min(base, room), {"review_status": "Needs artifact"}
+        elif action == "duplicate":
+            target, upd = 0.0, {"review_status": "Duplicate"}
+        else:   # reopen → back to pending
+            target, upd = min(base, room), {"review_status": "Pending review"}
+        upd["review_note"] = (reason or "").strip() or None
+        if (upd.get("review_status") == st0 and round(target, 1) == round(row["credits_award"] or 0, 1)
+                and upd.get("strength", row["strength"]) == row["strength"]):
+            return None
+        return {"updates": upd, "target_award": target, "action": action, "note": reason}
+
+    try:
+        ok, msg, delta = db.evidence_tx(team_id, evidence_id, decide, actor=actor)
+    except _ReviewRefused as exc:
+        return False, str(exc), 0
+    if ok:
+        e = db.get_evidence(team_id, evidence_id)
+        if e and e.get("assumption_id"):
+            refresh_assumption_status(team_id, e["assumption_id"])
+    return ok, msg, delta
+
+
+def withdraw_evidence(team_id, evidence_id, reason=""):
+    """A team retracts one of its own items (e.g. mislabelled). Its credits are
+    returned; it stops counting; it stays visible in the ledger with its history.
+    The team can then log a corrected item. Returns (ok, message, delta)."""
+    def decide(row, others):
+        if row.get("review_status") in (None,):
+            raise _ReviewRefused("Legacy items can't be withdrawn here — ask your instructor.")
+        if row.get("review_status") in ("Withdrawn", "Duplicate"):
+            return None
+        return {"updates": {"review_status": "Withdrawn",
+                            "review_note": (reason or "").strip() or "Withdrawn by team"},
+                "target_award": 0.0, "action": "withdrawn by team", "note": reason}
+    try:
+        ok, msg, delta = db.evidence_tx(team_id, evidence_id, decide, actor="team")
+    except _ReviewRefused as exc:
+        return False, str(exc), 0
+    if ok:
+        e = db.get_evidence(team_id, evidence_id)
+        if e and e.get("assumption_id"):
+            refresh_assumption_status(team_id, e["assumption_id"])
+    return ok, ("Withdrawn — credits returned. Log a corrected item if needed." if delta or ok
+                else msg), delta
+
+
+class _ReviewRefused(Exception):
+    pass
+
+
+def review_queue(team_ids):
+    """Evidence awaiting the instructor: Pending review or Needs artifact, oldest first."""
+    out = []
+    for tid in team_ids:
+        for e in db.list_evidence(tid):
+            if e.get("review_status") in ("Pending review", "Needs artifact"):
+                out.append(e)
+    return sorted(out, key=lambda e: e["id"])
 
 
 # --------------------------------------------------------------------------- #
-# Experiment purchasing
+# Assumption (Claim) status — derived from evidence, not typed in.
 # --------------------------------------------------------------------------- #
+def derived_assumption_status(team_id, assum_id):
+    """What the evidence says the status should be, or None if it doesn't decide.
+
+    1. The most recent experiment on it with a Supported/Refuted outcome decides.
+    2. Otherwise ≥ ASSUMPTION_SETTLE_MIN_ITEMS qualified items in one direction with
+       combined strength ≥ ASSUMPTION_SETTLE_MIN_STRENGTH settle it (if both
+       directions qualify, it stays Testing — the evidence conflicts).
+    3. Otherwise, any experiment or linked evidence means Testing."""
+    exps = [e for e in db.list_experiments(team_id) if e["assumption_id"] == assum_id]
+    resolved = sorted((e for e in exps if e["outcome"] in ("Supported", "Refuted")),
+                      key=lambda e: e["id"])
+    if resolved:
+        return resolved[-1]["outcome"]
+    ev = [e for e in db.list_evidence(team_id)
+          if e.get("assumption_id") == assum_id and evidence_is_qualified(e)]
+    def settles(d):
+        items = [e for e in ev if e.get("direction") == d]
+        return (len(items) >= content.ASSUMPTION_SETTLE_MIN_ITEMS
+                and sum(e["strength"] or 0 for e in items) >= content.ASSUMPTION_SETTLE_MIN_STRENGTH)
+    sup, con = settles("Supports"), settles("Contradicts")
+    if sup and not con:
+        return "Supported"
+    if con and not sup:
+        return "Refuted"
+    any_linked = exps or [e for e in db.list_evidence(team_id)
+                          if e.get("assumption_id") == assum_id
+                          and e.get("review_status") not in db.EVIDENCE_EXCLUDED_STATUSES]
+    return "Testing" if any_linked else None
+
+
+def refresh_assumption_status(team_id, assum_id):
+    """Re-derive an assumption's status after new evidence/results. Instructor
+    overrides are never touched. Legacy hand-set Supported/Refuted statuses are kept
+    unless the evidence now settles the assumption. Returns the status."""
+    a = db.get_assumption(team_id, assum_id)
+    if not a:
+        return None
+    src = a.get("status_source")
+    if src == "instructor":
+        return a["status"]
+    derived = derived_assumption_status(team_id, assum_id)
+    cur = a["status"]
+    if derived in ("Supported", "Refuted"):
+        new = derived
+    elif cur in ("Supported", "Refuted") and src in (None, "legacy", "student"):
+        return cur                       # grandfathered — evidence hasn't settled it yet
+    elif derived == "Testing":
+        new = "Testing"
+    elif cur in ("Supported", "Refuted"):
+        new = "Testing" if src == "derived" else cur   # derived result went away
+    else:
+        return cur                       # Untested / Ignored stay as the team set them
+    if new != cur or src != "derived":
+        db.set_assumption_status(team_id, assum_id, new, "derived",
+                                 "Set automatically from experiment results/evidence")
+    return new
+
+
+def set_assumption_status_by_team(team_id, assum_id, status):
+    """Teams may only mark Untested / Testing / Ignored. Supported and Refuted come
+    from evidence (or an instructor). Returns (ok, message)."""
+    a = db.get_assumption(team_id, assum_id)
+    if not a:
+        return False, "Assumption not found for your team."
+    if status not in content.ASSUMPTION_MANUAL_STATUSES:
+        return False, ("Supported and Refuted are set automatically when a test resolves or "
+                       "reviewed evidence settles the assumption.")
+    if a.get("status_source") == "instructor":
+        return False, "Your instructor set this status; ask them to change it."
+    if a["status"] in ("Supported", "Refuted") and a.get("status_source") == "derived":
+        return False, ("This status comes from your evidence. Log new evidence (or run a test) "
+                       "if you think it has changed.")
+    db.set_assumption_status(team_id, assum_id, status, "student", None)
+    return True, "Status updated."
+
+
+def instructor_set_assumption_status(team_id, assum_id, status, reason):
+    """Director override (or release of an override with status='auto')."""
+    if not (reason or "").strip():
+        return False, "Add a reason the team will see."
+    if status == "auto":
+        db.set_assumption_status(team_id, assum_id,
+                                 (db.get_assumption(team_id, assum_id) or {}).get("status", "Untested"),
+                                 "derived", None)
+        return True, f"Released to automatic: now {refresh_assumption_status(team_id, assum_id)}."
+    if status not in content.ASSUMPTION_ALL_STATUSES:
+        return False, "Unknown status."
+    n = db.set_assumption_status(team_id, assum_id, status, "instructor", reason.strip())
+    return (True, "Override saved.") if n else (False, "Assumption not found for that team.")
+
+
+# --------------------------------------------------------------------------- #
+# Experiment purchasing and results (Stage 1: atomic, pre-registered, computed)
+# --------------------------------------------------------------------------- #
+def validate_thresholds(success_value, failure_value, higher_is_better=True):
+    """None if the numeric thresholds are coherent, else a helpful message."""
+    if success_value is None or failure_value is None:
+        return "Enter a number for both the success and failure thresholds."
+    if higher_is_better and not success_value > failure_value:
+        return ("When higher is better, the success threshold must be ABOVE the failure "
+                "threshold (the gap between them is the 'inconclusive' zone).")
+    if not higher_is_better and not success_value < failure_value:
+        return ("When lower is better, the success threshold must be BELOW the failure "
+                "threshold (the gap between them is the 'inconclusive' zone).")
+    return None
+
+
+def compute_outcome(exp, observed_value):
+    """Compare an observed value to the pre-registered numeric thresholds.
+    Returns Supported / Refuted / Inconclusive, or None if the experiment has no
+    numeric thresholds (legacy) or no observation yet."""
+    sv, fv = exp.get("success_value"), exp.get("failure_value")
+    if sv is None or fv is None or observed_value is None:
+        return None
+    hib = exp.get("higher_is_better")
+    hib = True if hib is None else bool(hib)
+    v = float(observed_value)
+    if hib:
+        return "Supported" if v >= sv else ("Refuted" if v <= fv else "Inconclusive")
+    return "Supported" if v <= sv else ("Refuted" if v >= fv else "Inconclusive")
+
+
+def experiment_locked(exp, current_round=None):
+    """A recorded result locks once the round it was recorded in has ended."""
+    rr = exp.get("result_round")
+    cur = db.current_round() if current_round is None else current_round
+    return rr is not None and rr < cur
+
+
 def purchase_experiment(team_id, card, assumption_id, hypothesis, metric,
                         success_threshold, failure_threshold, decision_rule,
-                        predicted_outcome=None, confidence=None):
-    """Charge the team and record a designed experiment.
+                        predicted_outcome=None, confidence=None, success_value=None,
+                        failure_value=None, higher_is_better=None, request_key=None):
+    """Charge the team and record a designed experiment — atomically.
 
-    Captures the team's PREDICTION and confidence up front so we can later compare
-    forecast vs. result — a calibration loop that builds entrepreneurial judgment.
-    Returns (ok, message, experiment_id|None).
-    """
-    ok, msg = db.adjust_resources(
-        team_id,
-        money=-card["money"],
-        credits=-card["credits"],
-        hours=-card["hours"],
-        kind="experiment",
-        description=f"Purchased experiment: {card['name']}",
-    )
+    Captures the team's PREDICTION and confidence up front (calibration loop) and,
+    for new experiments, NUMERIC success/failure thresholds so the outcome can be
+    computed from the observed result. A retried submit with the same request_key
+    never charges twice. Returns (ok, message, experiment_id|None)."""
+    if success_value is not None or failure_value is not None:
+        err = validate_thresholds(success_value, failure_value,
+                                  True if higher_is_better is None else bool(higher_is_better))
+        if err:
+            return False, err, None
+    plan = {"hypothesis": hypothesis, "metric": metric, "success_threshold": success_threshold,
+            "failure_threshold": failure_threshold, "decision_rule": decision_rule,
+            "predicted_outcome": predicted_outcome, "confidence": confidence,
+            "success_value": success_value, "failure_value": failure_value,
+            "higher_is_better": (None if higher_is_better is None else int(bool(higher_is_better)))}
+    ok, msg, exp_id, _created = db.purchase_experiment_tx(
+        team_id, card, assumption_id, plan, request_key=request_key,
+        round_no=db.current_round())
+    return ok, msg, exp_id
+
+
+_OUTCOME_DIRECTION = {"Supported": "Supports", "Refuted": "Contradicts",
+                      "Inconclusive": "Inconclusive"}
+
+
+def record_experiment_result(team_id, exp_id, observed_value=None, observed_n=None,
+                             result_text="", learned="", decision="", outcome=None,
+                             override_reason=""):
+    """Save a Learning Card. With numeric thresholds the outcome is COMPUTED from the
+    observed value; choosing a different outcome needs a written reason (and sends
+    the resulting evidence to instructor review). A resolved result (Supported,
+    Refuted or Inconclusive) creates exactly one linked evidence item, paid by the
+    same rules as any evidence — contradicting results earn the same as supporting.
+    Results lock when the round they were recorded in ends.
+    Returns (ok, message)."""
+    exp = next((e for e in db.list_experiments(team_id) if e["id"] == exp_id), None)
+    if not exp:
+        return False, "Experiment not found for your team."
+    if experiment_locked(exp):
+        return False, ("This result was recorded in an earlier round and is now locked. "
+                       "Ask your instructor if it needs correcting.")
+    computed = compute_outcome(exp, observed_value)
+    override_reason = (override_reason or "").strip()
+    if outcome is None:
+        outcome = computed
+    if outcome is None:
+        return False, "Enter the observed value (or choose an outcome)."
+    if computed and outcome in _OUTCOME_DIRECTION and outcome != computed and not override_reason:
+        return False, (f"Your thresholds say this result is **{computed}**. To record "
+                       f"**{outcome}** instead, explain why in the override box.")
+    if (outcome in _OUTCOME_DIRECTION and computed is None
+            and not (result_text or "").strip() and observed_value is None):
+        return False, "Describe what you observed before recording an outcome."
+    resolved = outcome in _OUTCOME_DIRECTION
+    exp_updates = {"result": result_text, "learned": learned, "decision": decision,
+                   "outcome": outcome, "observed_value": observed_value,
+                   "observed_n": int(observed_n) if observed_n else None,
+                   "computed_outcome": computed,
+                   "override_reason": override_reason or None}
+    if resolved and exp.get("result_round") is None:
+        exp_updates["result_round"] = db.current_round()
+    ev_fields = None
+    award = 0.0
+    if resolved:
+        strength = int(exp.get("evidence_strength") or 0)
+        obs = (f"{observed_value:g}" if observed_value is not None else "")
+        desc = (f"{exp['card_type']} result — {exp.get('metric') or 'metric'}: {obs} "
+                f"{('(n=' + str(int(observed_n)) + ') ') if observed_n else ''}"
+                f"{('— ' + result_text.strip()) if (result_text or '').strip() else ''}").strip()
+        overridden = bool(computed and outcome != computed)
+        ev_fields = {"description": desc[:500], "direction": _OUTCOME_DIRECTION[outcome],
+                     "justification": (learned or "").strip() or "Pre-registered test result",
+                     "sample_n": int(observed_n) if observed_n else None}
+        if not exp.get("evidence_id"):
+            auto = strength <= content.EVIDENCE_AUTO_ACCEPT_MAX_STRENGTH and not overridden
+            ev_fields.update({
+                "evidence_type": f"Experiment result: {exp['card_type']}", "strength": strength,
+                "source": f"Experiment #{exp_id} (pre-registered test)",
+                "assumption_id": exp["assumption_id"], "origin": "Real-world",
+                "collected_on": _today(),
+                "review_status": "Auto-accepted" if auto else "Pending review",
+                "dedupe_key": f"experiment {exp_id}"})
+            award = content.EVIDENCE_BASE_CREDIT + (evidence_release(strength) if auto else 0)
+        elif overridden:
+            ev_fields["review_status"] = "Pending review"
+    ok, msg, ev_id = db.record_experiment_result_tx(
+        team_id, exp_id, exp_updates, ev_fields, award,
+        content.EVIDENCE_CREDIT_CAP_PER_ROUND, db.current_round())
     if not ok:
-        return False, msg, None
-    exp_id = db.add_experiment(
-        team_id, assumption_id, card["name"], card["money"], card["hours"],
-        card["credits"], card["strength"], hypothesis, metric,
-        success_threshold, failure_threshold, decision_rule,
-        predicted_outcome=predicted_outcome, confidence=confidence,
-    )
-    _add_usage(team_id, "spent_build", card["hours"])
-    return True, "Experiment purchased and designed.", exp_id
+        return False, msg
+    if exp["assumption_id"]:
+        refresh_assumption_status(team_id, exp["assumption_id"])
+    if not resolved:
+        return True, "Saved."
+    note = {"Supported": "Your thresholds were met.",
+            "Refuted": "The result crossed your failure threshold — a clear answer is "
+                       "valuable learning; use your decision rule.",
+            "Inconclusive": "The result landed between your thresholds — the assumption "
+                            "stays 'Testing'. Consider a stronger or better-targeted test."}[outcome]
+    return True, f"Learning Card saved as **{outcome}**. {note}"
 
 
 # --------------------------------------------------------------------------- #
@@ -1559,7 +1985,8 @@ def compute_valuation(team_id):
 # Evidence-portfolio analytics
 # --------------------------------------------------------------------------- #
 def evidence_summary(team_id):
-    ev = db.list_evidence(team_id)
+    # Only counted evidence: real-world, not withdrawn/duplicate/practice.
+    ev = db.list_counted_evidence(team_id)
     total_strength = sum(e["strength"] for e in ev)
     total_credits = sum(e["credits_award"] for e in ev)
     behavioral = sum(1 for e in ev if e["strength"] >= 6)
@@ -1984,11 +2411,14 @@ def founder_level(team_id):
 def team_badges(team_id):
     """Set of badge codes the team has EARNED, computed from current state."""
     codes = set()
-    ev = db.list_evidence(team_id)
+    ev = db.list_counted_evidence(team_id)
     es = evidence_summary(team_id)
     if ev:
         codes.add("first_evidence")
-    if any((e["strength"] or 0) >= 9 for e in ev):
+    # A paying-customer badge needs an ACCEPTED (or legacy) top-of-ladder item —
+    # a self-rated claim still awaiting review doesn't earn it.
+    if any((e["strength"] or 0) >= 9 and (e.get("review_status") is None
+                                          or evidence_is_qualified(e)) for e in ev):
         codes.add("paying_customer")
     if es["count"] >= 4 and es["behavioral"] / es["count"] >= 0.5:
         codes.add("behavior_beats_opinion")
@@ -2109,7 +2539,7 @@ def set_demo_open(game_id, on):
 
 
 def strongest_evidence(team_id):
-    ev = db.list_evidence(team_id)
+    ev = db.list_counted_evidence(team_id)
     return max(ev, key=lambda e: e["strength"]) if ev else None
 
 
@@ -3045,7 +3475,86 @@ def round_score_available(rnd):
     return avail
 
 
-def round_score(team_id, rnd, config=None):
+def _team_game_round(team_id):
+    """The current round of the TEAM'S game (not whatever game is active)."""
+    t = db.get_team(team_id)
+    g = db.get_game(t["game_id"]) if t and t.get("game_id") else None
+    return int(g["current_round"]) if g else db.current_round()
+
+
+def _frozen_view(fr):
+    """Shape a stored round_results row like a live round_score result."""
+    res = dict(fr["result"] or {})
+    auto = float(fr["score"] or 0)
+    adj = float(fr.get("adjustment") or 0)
+    final = max(0.0, min(100.0, auto + adj))
+    res.update({"finalized": True, "auto_score": round(auto, 1), "adjustment": round(adj, 1),
+                "adjust_reason": fr.get("adjust_reason"), "score": round(final, 1),
+                "grade": round_score_band(final), "finalized_at": fr.get("finalized_at"),
+                "finalized_source": fr.get("source"), "rubric_version": fr.get("rubric_version"),
+                "history": fr.get("history") or []})
+    return res
+
+
+def finalize_round_result(team_id, rnd, source="advance"):
+    """Freeze a team's score for a closed round (first write wins). Returns the row."""
+    existing = db.get_round_result(team_id, rnd)
+    if existing:
+        return existing
+    cfg = get_round_score_config()
+    live = _live_round_score(team_id, rnd, cfg)
+    t = db.get_team(team_id) or {}
+    db.insert_round_result(team_id, rnd, t.get("game_id"), live["score"], live, cfg,
+                           content.ROUND_RUBRIC_VERSION, source)
+    db.invalidate_run_cache()
+    return db.get_round_result(team_id, rnd)
+
+
+def recompute_round_result(team_id, rnd, reason):
+    """Director correction: re-score a finalized round from the team's CURRENT work and
+    current settings. Requires a reason; the previous score stays in the history."""
+    if not (reason or "").strip():
+        return False, "Give a reason for recomputing (it's kept in the score history)."
+    if not db.get_round_result(team_id, rnd):
+        finalize_round_result(team_id, rnd, source="recompute")
+        return True, "Finalized."
+    cfg = get_round_score_config()
+    live = _live_round_score(team_id, rnd, cfg)
+    db.update_round_result(team_id, rnd, "recompute", reason.strip(), score=live["score"],
+                           result=live, config=cfg, source="recompute",
+                           finalized_at=db.now())
+    return True, f"Recomputed: {live['score']:.1f}."
+
+
+def adjust_round_result(team_id, rnd, adjustment, reason):
+    """Director adjustment (±points) on top of the frozen automated score."""
+    if not (reason or "").strip():
+        return False, "Give a reason for the adjustment (the team can see it)."
+    if not db.get_round_result(team_id, rnd):
+        finalize_round_result(team_id, rnd, source="adjust")
+    db.update_round_result(team_id, rnd, "adjust", reason.strip(),
+                           adjustment=float(adjustment), adjust_reason=reason.strip(),
+                           adjusted_at=db.now())
+    return True, "Adjustment saved."
+
+
+def round_score(team_id, rnd, config=None, live=False):
+    """A team's round score. Rounds that have ENDED return the frozen, stored result
+    (finalized at advance, or lazily the first time an older round is viewed), so
+    later work and later setting changes never rewrite history. The current round
+    is computed live. Pass live=True to force a live computation (preview only)."""
+    if not live:
+        fr = db.get_round_result(team_id, rnd)
+        if fr is None and rnd < _team_game_round(team_id):
+            fr = finalize_round_result(team_id, rnd, source="backfill")
+        if fr is not None:
+            return _frozen_view(fr)
+    res = _live_round_score(team_id, rnd, config)
+    res["finalized"] = False
+    return res
+
+
+def _live_round_score(team_id, rnd, config=None):
     """Return a 0–100 round score with its component breakdown.
 
     Only counts what the team could actually DO this round: commitment (this round's

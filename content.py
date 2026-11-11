@@ -453,7 +453,33 @@ EVIDENCE_LADDER = [
 EVIDENCE_LADDER_MAP = {label: value for label, value in EVIDENCE_LADDER}
 
 # Evidence Credits awarded per unit of evidence strength when logged to the ledger.
+# (Legacy rule, kept for reference: before Stage 1 every item paid strength × 1.0.)
 CREDITS_PER_STRENGTH = 1.0
+
+# ---- Stage 1 evidence credit rules (Venture Foundry's own simulation rules) ----
+# Logging a complete real-world item pays a small base credit at once. The rest
+# (strength × EVIDENCE_RELEASE_PER_STRENGTH) is released when the item is accepted:
+# automatically for lower-strength items with no wording flag, by the instructor for
+# behavioral (strong) claims or flagged items. Supporting and contradicting evidence
+# are paid identically — disproving an assumption is as valuable as confirming it.
+EVIDENCE_BASE_CREDIT = 1.0
+EVIDENCE_RELEASE_PER_STRENGTH = 0.5
+EVIDENCE_AUTO_ACCEPT_MAX_STRENGTH = 5      # above this, an instructor reviews the claim
+EVIDENCE_CREDIT_CAP_PER_ROUND = 30.0       # evidence credits a team can earn per round
+
+EVIDENCE_ORIGINS = ["Real-world", "AI practice"]   # "Simulation" is set only by the app
+EVIDENCE_DIRECTIONS = ["Supports", "Contradicts", "Inconclusive"]
+EVIDENCE_REVIEW_STATUSES = ["Auto-accepted", "Pending review", "Accepted", "Downgraded",
+                            "Needs artifact", "Duplicate", "Withdrawn", "Practice"]
+# Assumption statuses a TEAM may set by hand. Supported/Refuted come only from a
+# resolved experiment or qualifying reviewed evidence (or an instructor override).
+ASSUMPTION_MANUAL_STATUSES = ["Untested", "Testing", "Ignored"]
+ASSUMPTION_ALL_STATUSES = ["Untested", "Testing", "Supported", "Refuted", "Ignored"]
+# Evidence that, on its own, settles an assumption: at least this many qualified
+# items pointing the same way with at least this much combined strength.
+ASSUMPTION_SETTLE_MIN_ITEMS = 2
+ASSUMPTION_SETTLE_MIN_STRENGTH = 10
+ROUND_RUBRIC_VERSION = "rs-1"            # stored with every finalized round result
 
 # --------------------------------------------------------------------------- #
 # Value Proposition Auction

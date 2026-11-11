@@ -419,6 +419,7 @@ INSTRUCTOR_PAGES = {
     "Pivot Committee": vi.pivot_committee,
     "Dashboard Scoring": vi.scoring,
     "Round Scores": vi.round_scores,
+    "Evidence Review": vi.evidence_review,
     "Misconception Radar": vi.misconception_radar,
     "Demo Day": vi.demo_day_admin,
     "Backup & Restore": vi.backup_restore,
@@ -427,7 +428,8 @@ INSTRUCTOR_PAGES = {
 # Grouped navigation so a first-time director isn't faced with 14 flat pages.
 INSTRUCTOR_NAV_GROUPS = {
     "⚙️ Set up (once)": ["Games", "Team Setup", "Schedule & Timing"],
-    "▶️ Run each round": ["Round Control", "Round Scores", "Auto-Director", "Backup & Restore"],
+    "▶️ Run each round": ["Round Control", "Evidence Review", "Round Scores", "Auto-Director",
+                         "Backup & Restore"],
     "📊 See how it's going": ["Cohort Overview", "Misconception Radar", "Demo Day"],
 }
 INSTRUCTOR_NAV_ADVANCED = ["Resources", "Market Events", "VP Auction",

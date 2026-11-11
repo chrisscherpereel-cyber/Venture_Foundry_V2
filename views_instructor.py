@@ -1702,7 +1702,8 @@ def round_scores():
     # ---- Scores table --------------------------------------------------------
     st.markdown("### 📋 Scores")
     rnd = st.number_input("Round to score", 1, logic.total_rounds(), db.current_round(),
-                          help="Round scores are computed live from each team's current work.")
+                          help="The current round is computed live. Rounds that have ended show "
+                               "the score frozen when the round closed.")
     rnd = int(rnd)
     ds = logic.deadline_status(rnd)
     if ds["set"]:
@@ -1723,7 +1724,9 @@ def round_scores():
         c = rs["components"]
         rows.append({
             "Team": t["name"],
+            "Status": "🔒 Finalized" if rs.get("finalized") else "Live",
             "Score /100": rs["score"],
+            "Adj.": rs.get("adjustment", 0) or 0,
             "Grade": rs["grade"],
             "Commit": "✅" if rs["committed"] else "—",
             "Completion": _cell(c["commitment"]),
@@ -1741,9 +1744,48 @@ def round_scores():
         st.caption("**n/a** = a component isn't graded this round because its tool isn't "
                    "introduced yet, so teams aren't marked down for it. Not counted in Round "
                    f"{rnd}: " + ", ".join(_off) + ". (Weights are renormalized over what counts.)")
-    st.caption("Scores recompute live from current work and your sensitivity settings above. "
-               "**Concept answers that reference the team's territory/venture score higher than "
+    if any(v.get("finalized") for v in scored.values()):
+        st.caption("🔒 **Finalized** rounds show the score saved when the round closed — later "
+                   "work and the sensitivity settings above don't change them. To correct one, "
+                   "use *Correct a finalized score* below (a reason is required and kept).")
+    else:
+        st.caption("This round is still open: scores recompute live from current work and your "
+                   "sensitivity settings above, and are frozen when the round advances.")
+    st.caption("**Concept answers that reference the team's territory/venture score higher than "
                "generic ones.**")
+
+    # ---- Corrections to a finalized round -----------------------------------
+    if rnd < db.current_round():
+        with st.expander("🛠️ Correct a finalized score"):
+            st.caption("Adjust adds or removes points on top of the frozen automated score. "
+                       "Recompute re-scores the round from the team's CURRENT work and current "
+                       "settings (use sparingly — e.g. after you fix a data error). Both are "
+                       "logged with your reason, and the team sees adjustments and reasons on "
+                       "My Venture.")
+            ct = st.selectbox("Team", teams, format_func=lambda t: t["name"], key="rs_fix_team")
+            cur_rs = scored[ct["id"]]
+            st.write(f"Automated: **{cur_rs.get('auto_score', cur_rs['score'])}** · adjustment "
+                     f"**{cur_rs.get('adjustment', 0):+g}** · shown: **{cur_rs['score']}**")
+            adj = st.number_input("Adjustment (points, replaces the current adjustment)",
+                                  -100.0, 100.0, float(cur_rs.get("adjustment", 0) or 0), 1.0,
+                                  key=f"rs_adj_{ct['id']}_{rnd}")
+            why = st.text_input("Reason (required)", key=f"rs_why_{ct['id']}_{rnd}")
+            b1, b2 = st.columns(2)
+            if b1.button("Save adjustment", key=f"rs_adj_btn_{ct['id']}_{rnd}"):
+                ok, msg = logic.adjust_round_result(ct["id"], rnd, adj, why)
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.rerun()
+            if b2.button("Recompute from current work", key=f"rs_rec_btn_{ct['id']}_{rnd}"):
+                ok, msg = logic.recompute_round_result(ct["id"], rnd, why)
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.rerun()
+            hist = cur_rs.get("history") or []
+            if hist:
+                st.caption("History: " + " · ".join(
+                    f"{h.get('at', '')[:16]} {h.get('action')}"
+                    + (f" ({h['reason']})" if h.get("reason") else "") for h in hist))
 
     # ---- Per-team detail + email --------------------------------------------
     st.markdown("### ✉️ Send a score to a team")
@@ -1775,6 +1817,157 @@ def round_scores():
             e = _round_score_email(t, rnd, scored[t["id"]])
             db.add_message(t["id"], e["subject"], e["body"], rnd)
         st.success(f"Sent Round {rnd} scores to every team.")
+
+
+# --------------------------------------------------------------------------- #
+# Evidence Review — the short weekly queue that releases (or withholds) credit for
+# strong or flagged evidence claims, plus assumption-status overrides.
+# --------------------------------------------------------------------------- #
+def _evidence_csv(teams):
+    import csv
+    import io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["team", "evidence_id", "round", "origin", "type", "strength", "direction",
+                "assumption_id", "who_context", "collected_on", "sample_n", "description",
+                "justification", "limitations", "review_status", "review_note", "credits"])
+    for t in teams:
+        for e in db.list_evidence(t["id"]):
+            w.writerow([t["name"], e["id"], e.get("round"), e.get("origin") or "Real-world (legacy)",
+                        e["evidence_type"], e["strength"], e.get("direction"),
+                        e.get("assumption_id"), e.get("source"), e.get("collected_on"),
+                        e.get("sample_n"), e["description"], e.get("justification"),
+                        e.get("limitations"), logic.evidence_review_label(e),
+                        e.get("review_note"), e["credits_award"]])
+    return buf.getvalue().encode("utf-8")
+
+
+def evidence_review():
+    st.subheader("🔎 Evidence Review")
+    _guide(
+        "Strong evidence claims (behavioral, strength "
+        f"{content.EVIDENCE_AUTO_ACCEPT_MAX_STRENGTH + 1}+) and items whose wording was flagged "
+        "wait here. A team gets a small base credit when it logs an item; the rest is released "
+        "when you accept it. Your decision is final for that item's credits and is shown to the "
+        "team with your note. Supporting and contradicting evidence are paid the same.",
+        steps=[
+            "Read the claim, who/context, sample, and the team's justification.",
+            "Accept it, downgrade it to the evidence type it really is, ask for an artifact "
+            "(e.g. the signed LOI or payment record), or mark it a duplicate.",
+            "Use 'Accept all unflagged' to clear routine items quickly.",
+            "Override an assumption's status below only when the automatic status is wrong.",
+        ],
+        terms=[
+            ("Downgrade", "Re-rate to a lower ladder type; credits are settled to match."),
+            ("Needs artifact", "Holds the release until the team shows proof; base credit kept."),
+            ("Duplicate", "A re-log of an item already counted; all its credits are returned."),
+            ("Legacy", "Items logged before reviews existed keep their original credits."),
+        ],
+    )
+    teams = db.list_teams()
+    if not teams:
+        st.info("No teams yet. Create teams on the Team Setup page first.")
+        return
+    by_id = {t["id"]: t for t in teams}
+    queue = logic.review_queue([t["id"] for t in teams])
+    st.metric("Waiting for review", len(queue))
+    flash = st.session_state.pop("_rev_flash", None)
+    if flash:
+        st.success(flash)
+
+    unflagged = [e for e in queue if e["review_status"] == "Pending review"
+                 and not logic.evidence_flags(e["description"], e["source"], e["strength"])
+                 and not (e.get("source") or "").startswith("Experiment #")]
+    if unflagged:
+        if st.button(f"✅ Accept all {len(unflagged)} unflagged pending item(s)",
+                     help="Accepts every pending item whose wording raised no flag. Flagged "
+                          "items and overridden experiment results still need a look."):
+            n = 0
+            for e in unflagged:
+                ok, _, _ = logic.review_evidence(e["team_id"], e["id"], "accept",
+                                                 "Accepted (bulk)")
+                n += ok
+            st.session_state["_rev_flash"] = f"Accepted {n} item(s)."
+            st.rerun()
+
+    ladder = [lbl for lbl, _ in content.EVIDENCE_LADDER]
+    for e in queue:
+        t = by_id.get(e["team_id"])
+        if not t:
+            continue
+        efl = logic.evidence_flags(e["description"], e["source"], e["strength"])
+        with st.expander(f"{'⚠️' if efl else '•'} {t['name']} · #{e['id']} · "
+                         f"[{e['strength']}/10] {e['description'][:70]}"
+                         + (" · needs artifact" if e["review_status"] == "Needs artifact" else "")):
+            st.write(f"**Type:** {e['evidence_type']}  ·  **Who / context:** {e['source'] or '—'}"
+                     + (f"  ·  **n =** {e['sample_n']}" if e.get("sample_n") else "")
+                     + (f"  ·  **Collected:** {e['collected_on']}" if e.get("collected_on") else "")
+                     + f"  ·  **Round:** {e.get('round') or '—'}")
+            if e.get("assumption_id"):
+                a = db.get_assumption(t["id"], e["assumption_id"])
+                st.write(f"**Assumption:** {(a or {}).get('text', '?')} — "
+                         f"*{e.get('direction') or 'no direction'}*")
+            st.write(f"**Team's justification:** {e.get('justification') or '—'}")
+            if e.get("limitations"):
+                st.write(f"**Limitations:** {e['limitations']}")
+            for f in efl:
+                st.warning("🔎 " + f + " *(wording heuristic — may be wrong)*")
+            st.caption(f"Credits so far: {e['credits_award']} · accepting pays up to "
+                       f"{content.EVIDENCE_BASE_CREDIT + logic.evidence_release(e['strength']):g} in total.")
+            note = st.text_input("Note to the team (required for downgrade / artifact / duplicate)",
+                                 key=f"rv_note_{e['id']}")
+            c1, c2, c3, c4 = st.columns([1, 2, 1.3, 1])
+            if c1.button("Accept", key=f"rv_acc_{e['id']}", type="primary"):
+                ok, msg, d = logic.review_evidence(t["id"], e["id"], "accept", note)
+                st.session_state["_rev_flash"] = f"#{e['id']}: {msg} ({d:+g} credits)" if ok else None
+                (st.rerun() if ok else st.error(msg))
+            lower = [lbl for lbl in ladder if content.EVIDENCE_LADDER_MAP[lbl] < (e["strength"] or 0)]
+            if lower:
+                nt = c2.selectbox("Downgrade to", lower, index=len(lower) - 1,
+                                  key=f"rv_type_{e['id']}", label_visibility="collapsed")
+                if c2.button("Downgrade", key=f"rv_dn_{e['id']}"):
+                    ok, msg, d = logic.review_evidence(t["id"], e["id"], "downgrade", note, nt)
+                    st.session_state["_rev_flash"] = f"#{e['id']}: {msg} ({d:+g} credits)" if ok else None
+                    (st.rerun() if ok else st.error(msg))
+            if c3.button("Needs artifact", key=f"rv_art_{e['id']}"):
+                ok, msg, d = logic.review_evidence(t["id"], e["id"], "needs_artifact", note)
+                st.session_state["_rev_flash"] = f"#{e['id']}: {msg}" if ok else None
+                (st.rerun() if ok else st.error(msg))
+            if c4.button("Duplicate", key=f"rv_dup_{e['id']}"):
+                ok, msg, d = logic.review_evidence(t["id"], e["id"], "duplicate", note)
+                st.session_state["_rev_flash"] = f"#{e['id']}: {msg} ({d:+g} credits)" if ok else None
+                (st.rerun() if ok else st.error(msg))
+
+    st.divider()
+    st.markdown("### Assumption status overrides")
+    st.caption("Statuses are normally automatic: a resolved pre-registered experiment, or "
+               f"{content.ASSUMPTION_SETTLE_MIN_ITEMS}+ accepted items pointing one way with "
+               f"combined strength {content.ASSUMPTION_SETTLE_MIN_STRENGTH}+, sets Supported or "
+               "Refuted. Override only when that's wrong; the team sees your reason.")
+    team = st.selectbox("Team", teams, format_func=lambda t: t["name"], key="rv_ateam")
+    assums = db.list_assumptions(team["id"])
+    if not assums:
+        st.caption("No assumptions yet.")
+    for a in assums:
+        src = a.get("status_source") or "legacy"
+        c1, c2, c3, c4 = st.columns([4, 1.6, 2.4, 1])
+        c1.write(f"[{a['status']} · {src}] {a['text'][:90]}")
+        choice = c2.selectbox("Status", ["auto"] + content.ASSUMPTION_ALL_STATUSES,
+                              key=f"rv_as_{a['id']}", label_visibility="collapsed",
+                              help="'auto' releases an override back to the evidence rules.")
+        why = c3.text_input("Reason", key=f"rv_asr_{a['id']}", label_visibility="collapsed",
+                            placeholder="reason (required)")
+        if c4.button("Set", key=f"rv_asb_{a['id']}"):
+            ok, msg = logic.instructor_set_assumption_status(team["id"], a["id"], choice, why)
+            (st.success if ok else st.error)(msg)
+            if ok:
+                st.rerun()
+
+    st.divider()
+    st.download_button("⬇️ Download all evidence (CSV)", _evidence_csv(teams),
+                       file_name=f"evidence_game{db.active_game_id()}.csv", mime="text/csv",
+                       help="Every item in this game, with origin, direction, review status and "
+                            "credits — for your records or grading spreadsheet.")
 
 
 # --------------------------------------------------------------------------- #
@@ -1873,15 +2066,17 @@ def overview():
         esum = logic.evidence_summary(t["id"])
         arep = logic.assumption_risk_report(t["id"])
         eff = logic.experiment_efficiency(t["id"])
-        flagged = sum(1 for e in db.list_evidence(t["id"])
+        flagged = sum(1 for e in db.list_counted_evidence(t["id"])
                       if logic.evidence_flags(e["description"], e["source"], e["strength"]))
+        in_review = sum(1 for e in db.list_evidence(t["id"])
+                        if e.get("review_status") in ("Pending review", "Needs artifact"))
         rows.append({
             "Team": f"{logic.team_identity(t)['mascot']} {logic.team_identity(t)['display']}",
             "Stage": t["stage"], "Capital": f"${t['capital']:,.0f}",
             "Credits": round(t["evidence_credits"], 1), "Valuation": f"${val['valuation']:,.0f}",
             "Evidence-backed": f"{val['evidence_coverage']*100:.0f}%",
             "Evidence items": esum["count"], "Behavioral": esum["behavioral"],
-            "⚠️ Flagged evidence": flagged,
+            "⚠️ Flagged evidence": flagged, "⏳ In review": in_review,
             "High-risk untested": len(arep["exposed"]), "Experiments": eff["experiments"],
         })
     st.dataframe(rows, use_container_width=True, hide_index=True)

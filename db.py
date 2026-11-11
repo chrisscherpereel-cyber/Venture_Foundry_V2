@@ -9,6 +9,7 @@ helpers here; views never write raw SQL.
 import sqlite3
 import json
 import os
+import re
 import secrets
 import threading
 from datetime import datetime, timezone
@@ -557,6 +558,81 @@ def _create_schema(conn, pg):
     # Rotating perspective (lens) taken for this journal entry, + the lens answer.
     _ensure_column(conn, pg, "reflections", "perspective", "TEXT")
     _ensure_column(conn, pg, "reflections", "perspective_note", "TEXT")
+    _stage1_schema(conn, pg)
+
+
+# --------------------------------------------------------------------------- #
+# Stage 1 ("trustworthy record") — additive, repeatable migrations only.
+#   Every statement is IF NOT EXISTS / ADD COLUMN-if-missing, so running init_db
+#   on an older database (or twice) is safe and never drops or rewrites data.
+#   Legacy rows keep NULL in the new columns and are treated as "legacy" by logic.
+# --------------------------------------------------------------------------- #
+def _stage1_schema(conn, pg):
+    # Round stamping: which round a record was created in.
+    _ensure_column(conn, pg, "evidence", "round", "INTEGER")
+    _ensure_column(conn, pg, "assumptions", "round_created", "INTEGER")
+    _ensure_column(conn, pg, "experiments", "round", "INTEGER")
+    _ensure_column(conn, pg, "canvases", "round", "INTEGER")
+    # Evidence model: origin, interpretation, review status and audit history.
+    _ensure_column(conn, pg, "evidence", "origin", "TEXT")          # Real-world | Simulation | AI practice
+    _ensure_column(conn, pg, "evidence", "direction", "TEXT")       # Supports | Contradicts | Inconclusive
+    _ensure_column(conn, pg, "evidence", "collected_on", "TEXT")    # ISO date the evidence was gathered
+    _ensure_column(conn, pg, "evidence", "sample_n", "INTEGER")
+    _ensure_column(conn, pg, "evidence", "limitations", "TEXT")
+    _ensure_column(conn, pg, "evidence", "experiment_id", "INTEGER")
+    _ensure_column(conn, pg, "evidence", "review_status", "TEXT")   # NULL = legacy (pre-review)
+    _ensure_column(conn, pg, "evidence", "review_note", "TEXT")
+    _ensure_column(conn, pg, "evidence", "dedupe_key", "TEXT")
+    _ensure_column(conn, pg, "evidence", "history", "TEXT")         # JSON list of changes
+    # Experiments: numeric pre-registered thresholds, observed result, lock + idempotency.
+    _ensure_column(conn, pg, "experiments", "success_value", "REAL")
+    _ensure_column(conn, pg, "experiments", "failure_value", "REAL")
+    _ensure_column(conn, pg, "experiments", "higher_is_better", "INTEGER")
+    _ensure_column(conn, pg, "experiments", "observed_value", "REAL")
+    _ensure_column(conn, pg, "experiments", "observed_n", "INTEGER")
+    _ensure_column(conn, pg, "experiments", "computed_outcome", "TEXT")
+    _ensure_column(conn, pg, "experiments", "override_reason", "TEXT")
+    _ensure_column(conn, pg, "experiments", "result_round", "INTEGER")
+    _ensure_column(conn, pg, "experiments", "evidence_id", "INTEGER")
+    _ensure_column(conn, pg, "experiments", "request_key", "TEXT")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_experiments_request "
+                 "ON experiments(team_id, request_key) WHERE request_key IS NOT NULL")
+    # Assumptions (= Claims): where the current status came from.
+    _ensure_column(conn, pg, "assumptions", "status_source", "TEXT")   # NULL legacy | student | derived | instructor
+    _ensure_column(conn, pg, "assumptions", "status_note", "TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_evidence_team ON evidence(team_id)")
+    # Frozen round results — the stored, stable record of a finalized round's score.
+    conn.execute("""CREATE TABLE IF NOT EXISTS round_results (
+        team_id       INTEGER NOT NULL,
+        round         INTEGER NOT NULL,
+        game_id       INTEGER,
+        score         REAL,
+        result        TEXT,
+        config        TEXT,
+        rubric_version TEXT,
+        source        TEXT,
+        finalized_at  TEXT,
+        adjustment    REAL DEFAULT 0,
+        adjust_reason TEXT,
+        adjusted_at   TEXT,
+        history       TEXT,
+        PRIMARY KEY (team_id, round),
+        FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE)""")
+
+
+def _normalize_dedupe(*parts):
+    """Normalized key for spotting a re-logged copy of the same evidence."""
+    text = " ".join((p or "") for p in parts).lower()
+    return " ".join(re.findall(r"[a-z0-9]+", text))[:300]
+
+
+def _backfill_stage1(conn):
+    """Fill dedupe keys on legacy evidence (repeatable: only touches NULLs)."""
+    rows = conn.execute(
+        "SELECT id, description, source FROM evidence WHERE dedupe_key IS NULL").fetchall()
+    for r in rows:
+        conn.execute("UPDATE evidence SET dedupe_key=? WHERE id=?",
+                     (_normalize_dedupe(r["description"], r["source"]), r["id"]))
 
 
 def init_db():
@@ -573,6 +649,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass   # e.g. a filesystem that can't do WAL — fall back to the default
         _create_schema(conn, IS_PG)
+        _backfill_stage1(conn)
         # Seed default settings once.
         cur = conn.execute("SELECT value FROM settings WHERE key='current_round'")
         if cur.fetchone() is None:
@@ -963,9 +1040,9 @@ def save_canvas(team_id, ctype, data, label="", note=""):
     conn = get_conn()
     try:
         conn.execute(
-            """INSERT INTO canvases(team_id, ctype, version, label, data, note, created_at)
-               VALUES(?,?,?,?,?,?,?)""",
-            (team_id, ctype, v, label, _dumps(data), note, now()),
+            """INSERT INTO canvases(team_id, ctype, version, label, data, note, round, created_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (team_id, ctype, v, label, _dumps(data), note, current_round(), now()),
         )
         conn.commit()
         return v
@@ -1016,9 +1093,11 @@ def add_assumption(team_id, text, risk_type="Desirability", importance=3,
     try:
         conn.execute(
             """INSERT INTO assumptions(team_id, text, risk_type, importance,
-                                       evidence_level, testability, status, created_at)
-               VALUES(?,?,?,?,?,?, 'Untested', ?)""",
-            (team_id, text, risk_type, importance, evidence_level, testability, now()),
+                                       evidence_level, testability, status, status_source,
+                                       round_created, created_at)
+               VALUES(?,?,?,?,?,?, 'Untested', 'student', ?, ?)""",
+            (team_id, text, risk_type, importance, evidence_level, testability,
+             current_round(), now()),
         )
         conn.commit()
     finally:
@@ -1073,11 +1152,12 @@ def add_experiment(team_id, assumption_id, card_type, cost_money, cost_time,
             """INSERT INTO experiments(team_id, assumption_id, card_type, cost_money,
                 cost_time, cost_credits, evidence_strength, hypothesis, metric,
                 success_threshold, failure_threshold, decision_rule,
-                predicted_outcome, confidence, outcome, created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'Designed', ?)""",
+                predicted_outcome, confidence, round, outcome, created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'Designed', ?)""",
             (team_id, assumption_id, card_type, cost_money, cost_time, cost_credits,
              evidence_strength, hypothesis, metric, success_threshold,
-             failure_threshold, decision_rule, predicted_outcome, confidence, now()),
+             failure_threshold, decision_rule, predicted_outcome, confidence,
+             current_round(), now()),
         )
         conn.commit()
         return cur.lastrowid
@@ -1120,10 +1200,11 @@ def add_evidence(team_id, description, evidence_type, strength, source,
         conn.execute(
             """INSERT INTO evidence(team_id, description, evidence_type, strength,
                                     source, assumption_id, credits_award,
-                                    justification, created_at)
-               VALUES(?,?,?,?,?,?,?,?,?)""",
+                                    justification, round, dedupe_key, created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (team_id, description, evidence_type, strength, source,
-             assumption_id, credits_award, justification, now()),
+             assumption_id, credits_award, justification, current_round(),
+             _normalize_dedupe(description, source), now()),
         )
         conn.commit()
     finally:
@@ -1138,6 +1219,403 @@ def list_evidence(team_id):
             "SELECT * FROM evidence WHERE team_id=? ORDER BY id DESC", (team_id,)
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# Review statuses that take an item OUT of the team's counted evidence.
+EVIDENCE_EXCLUDED_STATUSES = ("Withdrawn", "Duplicate", "Practice")
+REAL_ORIGINS = (None, "", "Real-world")
+
+
+@run_memo
+def list_counted_evidence(team_id):
+    """Evidence that counts toward deliverables, summaries and valuation: real-world
+    items (legacy rows have no origin and count) that weren't withdrawn, marked as a
+    duplicate, or logged as AI practice."""
+    return [e for e in list_evidence(team_id)
+            if (e.get("origin") in REAL_ORIGINS)
+            and (e.get("review_status") not in EVIDENCE_EXCLUDED_STATUSES)]
+
+
+@run_memo
+def get_evidence(team_id, evidence_id):
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT * FROM evidence WHERE id=? AND team_id=?",
+                           (evidence_id, team_id)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Stage 1 transactional helpers
+#   Each one locks the team row, does ALL of its related writes, and commits once,
+#   so a failure part-way leaves nothing half-written (no charge without a record,
+#   no credit without an evidence row). Every query is scoped by team_id.
+# --------------------------------------------------------------------------- #
+def _begin_team_lock(conn, team_id):
+    """Start a write transaction and lock the team row. Returns the row or None."""
+    conn.execute("BEGIN IMMEDIATE")              # SQLite: take the write lock now
+    return conn.execute(
+        "SELECT * FROM teams WHERE id=?" + (" FOR UPDATE" if IS_PG else ""),
+        (team_id,)).fetchone()                   # Postgres: row lock
+
+
+def _apply_resources(conn, team, money=0, credits=0, hours=0, kind="adjust",
+                     description="", allow_negative=False):
+    """Resource change INSIDE an open transaction (no commit). (ok, message)."""
+    new_money = (team["capital"] or 0) + money
+    new_credits = (team["evidence_credits"] or 0) + credits
+    new_hours = (team["founder_hours"] or 0) + hours
+    if not allow_negative:
+        if new_money < 0:
+            return False, "Not enough capital."
+        if new_credits < 0:
+            return False, "Not enough Evidence Credits."
+        if new_hours < 0:
+            return False, "Not enough founder-hours."
+    conn.execute("UPDATE teams SET capital=?, evidence_credits=?, founder_hours=? WHERE id=?",
+                 (new_money, new_credits, new_hours, team["id"]))
+    conn.execute(
+        """INSERT INTO transactions(team_id, kind, money, credits, hours, description, created_at)
+           VALUES(?,?,?,?,?,?,?)""",
+        (team["id"], kind, money, credits, hours, description, now()))
+    return True, "OK"
+
+
+def _round_evidence_credits(conn, team_id, round_no, exclude_id=None):
+    row = conn.execute(
+        "SELECT COALESCE(SUM(credits_award), 0) AS s FROM evidence "
+        "WHERE team_id=? AND round=?" + (" AND id<>?" if exclude_id else ""),
+        (team_id, round_no) + ((exclude_id,) if exclude_id else ())).fetchone()
+    return float(row["s"] or 0)
+
+
+def _append_history(raw, entry):
+    hist = _loads(raw, []) or []
+    hist.append({"at": now(), **entry})
+    return _dumps(hist)
+
+
+def purchase_experiment_tx(team_id, card, assumption_id, plan, request_key=None,
+                           round_no=None):
+    """Charge the team, create the experiment, record build-hours usage and mark the
+    tested assumption 'Testing' — all in ONE transaction.
+
+    Idempotent per (team, request_key): a retried or double-clicked submit returns
+    the experiment created the first time and charges nothing.
+    Returns (ok, message, experiment_id, created)."""
+    conn = get_conn()
+    try:
+        team = _begin_team_lock(conn, team_id)
+        if not team:
+            conn.rollback()
+            return False, "Team not found.", None, False
+        if request_key:
+            prior = conn.execute(
+                "SELECT id FROM experiments WHERE team_id=? AND request_key=?",
+                (team_id, request_key)).fetchone()
+            if prior:
+                conn.rollback()
+                return True, "Already purchased — nothing charged twice.", prior["id"], False
+        if assumption_id is not None:
+            a = conn.execute("SELECT id, status_source FROM assumptions WHERE id=? AND team_id=?",
+                             (assumption_id, team_id)).fetchone()
+            if not a:
+                conn.rollback()
+                return False, "That assumption doesn't belong to your team.", None, False
+        ok, msg = _apply_resources(conn, team, money=-card["money"], credits=-card["credits"],
+                                   hours=-card["hours"], kind="experiment",
+                                   description=f"Purchased experiment: {card['name']}")
+        if not ok:
+            conn.rollback()
+            return False, msg, None, False
+        cur = conn.execute(
+            """INSERT INTO experiments(team_id, assumption_id, card_type, cost_money,
+                cost_time, cost_credits, evidence_strength, hypothesis, metric,
+                success_threshold, failure_threshold, decision_rule,
+                predicted_outcome, confidence, success_value, failure_value,
+                higher_is_better, request_key, round, outcome, created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'Designed', ?)""",
+            (team_id, assumption_id, card["name"], card["money"], card["hours"],
+             card["credits"], card["strength"], plan.get("hypothesis"), plan.get("metric"),
+             plan.get("success_threshold"), plan.get("failure_threshold"),
+             plan.get("decision_rule"), plan.get("predicted_outcome"), plan.get("confidence"),
+             plan.get("success_value"), plan.get("failure_value"),
+             plan.get("higher_is_better"), request_key, round_no, now()))
+        exp_id = cur.lastrowid
+        conn.execute("UPDATE teams SET spent_build=COALESCE(spent_build,0)+? WHERE id=?",
+                     (card["hours"], team_id))
+        if assumption_id is not None:
+            conn.execute(
+                "UPDATE assumptions SET status='Testing', status_source='derived' "
+                "WHERE id=? AND team_id=? AND COALESCE(status_source,'')<>'instructor'",
+                (assumption_id, team_id))
+        conn.commit()
+        return True, "Experiment purchased and designed.", exp_id, True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def insert_evidence_tx(team_id, fields, award, cap, round_no):
+    """Insert an evidence row and pay its credits in ONE transaction.
+
+    Refuses an exact re-log of an existing, still-counted item (same normalized
+    description + source) — the double-click / copy-paste guard. Credits are
+    limited so this round's evidence credits never exceed `cap`.
+    Returns ("ok", evidence_id, paid) | ("duplicate", existing_id, 0) | ("error", msg, 0)."""
+    conn = get_conn()
+    try:
+        team = _begin_team_lock(conn, team_id)
+        if not team:
+            conn.rollback()
+            return "error", "Team not found.", 0
+        key = fields.get("dedupe_key")
+        if key:
+            prior = conn.execute(
+                "SELECT id FROM evidence WHERE team_id=? AND dedupe_key=? AND "
+                "COALESCE(review_status,'') NOT IN ('Withdrawn','Duplicate')",
+                (team_id, key)).fetchone()
+            if prior:
+                conn.rollback()
+                return "duplicate", prior["id"], 0
+        aid = fields.get("assumption_id")
+        if aid is not None and not conn.execute(
+                "SELECT id FROM assumptions WHERE id=? AND team_id=?", (aid, team_id)).fetchone():
+            conn.rollback()
+            return "error", "That assumption doesn't belong to your team.", 0
+        used = _round_evidence_credits(conn, team_id, round_no)
+        paid = round(max(0.0, min(float(award), cap - used)), 1)
+        cols = dict(fields)
+        cols.update({"team_id": team_id, "credits_award": paid, "round": round_no,
+                     "created_at": now(),
+                     "history": _append_history(None, {"by": "team", "action": "logged",
+                                                       "status": fields.get("review_status"),
+                                                       "credits": paid})})
+        names = list(cols)
+        cur = conn.execute(
+            f"INSERT INTO evidence({', '.join(names)}) VALUES({', '.join('?' for _ in names)})",
+            tuple(cols[n] for n in names))
+        ev_id = cur.lastrowid
+        if paid:
+            _apply_resources(conn, team, credits=paid, kind="evidence",
+                             description=f"Evidence logged: {fields.get('evidence_type')}",
+                             allow_negative=True)
+        conn.commit()
+        return "ok", ev_id, paid
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def evidence_tx(team_id, evidence_id, decide, actor="Director"):
+    """Change one evidence item's review state and settle its credits, atomically.
+
+    `decide(row, credits_used_elsewhere_this_round)` returns None (no change) or a
+    dict: {"updates": {...column: value...}, "target_award": float, "action": str,
+    "note": str}. The team is paid (or charged) exactly target_award − current award,
+    so applying the same decision twice changes nothing (idempotent).
+    Returns (ok, message, delta)."""
+    conn = get_conn()
+    try:
+        team = _begin_team_lock(conn, team_id)
+        if not team:
+            conn.rollback()
+            return False, "Team not found.", 0
+        row = conn.execute("SELECT * FROM evidence WHERE id=? AND team_id=?",
+                           (evidence_id, team_id)).fetchone()
+        if not row:
+            conn.rollback()
+            return False, "Evidence item not found for this team.", 0
+        row = dict(row)
+        others = _round_evidence_credits(conn, team_id, row.get("round"), exclude_id=row["id"]) \
+            if row.get("round") is not None else 0.0
+        res = decide(row, others)
+        if not res:
+            conn.rollback()
+            return True, "No change.", 0
+        target = round(float(res["target_award"]), 1)
+        delta = round(target - float(row.get("credits_award") or 0), 1)
+        updates = dict(res.get("updates", {}))
+        updates["credits_award"] = target
+        updates["history"] = _append_history(row.get("history"), {
+            "by": actor, "action": res.get("action", "review"),
+            "from": row.get("review_status"), "to": updates.get("review_status",
+                                                                row.get("review_status")),
+            "credits_delta": delta, "note": res.get("note", "")})
+        sets = ", ".join(f"{k}=?" for k in updates)
+        conn.execute(f"UPDATE evidence SET {sets} WHERE id=? AND team_id=?",
+                     (*updates.values(), evidence_id, team_id))
+        if delta:
+            _apply_resources(conn, team, credits=delta, kind="evidence_review",
+                             description=f"Evidence #{evidence_id} {res.get('action', 'review')}",
+                             allow_negative=True)
+        conn.commit()
+        return True, "Saved.", delta
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def record_experiment_result_tx(team_id, exp_id, exp_updates, evidence_fields, award, cap,
+                                round_no):
+    """Save an experiment's Learning Card AND its linked evidence row in ONE transaction.
+
+    The first save creates the evidence item (and pays its credits); later saves
+    (allowed only while the result is unlocked) update that same item's text and
+    direction without paying again. Returns (ok, message, evidence_id)."""
+    conn = get_conn()
+    try:
+        team = _begin_team_lock(conn, team_id)
+        if not team:
+            conn.rollback()
+            return False, "Team not found.", None
+        exp = conn.execute("SELECT * FROM experiments WHERE id=? AND team_id=?",
+                           (exp_id, team_id)).fetchone()
+        if not exp:
+            conn.rollback()
+            return False, "Experiment not found for this team.", None
+        exp = dict(exp)
+        ev_id = exp.get("evidence_id")
+        if ev_id and not conn.execute("SELECT id FROM evidence WHERE id=? AND team_id=?",
+                                      (ev_id, team_id)).fetchone():
+            ev_id = None                         # linked row was removed — recreate
+        if evidence_fields is not None:
+            if ev_id:
+                sets = ", ".join(f"{k}=?" for k in evidence_fields)
+                conn.execute(f"UPDATE evidence SET {sets} WHERE id=? AND team_id=?",
+                             (*evidence_fields.values(), ev_id, team_id))
+            else:
+                used = _round_evidence_credits(conn, team_id, round_no)
+                paid = round(max(0.0, min(float(award), cap - used)), 1)
+                cols = dict(evidence_fields)
+                cols.update({"team_id": team_id, "credits_award": paid, "round": round_no,
+                             "experiment_id": exp_id, "created_at": now(),
+                             "history": _append_history(None, {
+                                 "by": "team", "action": "experiment result",
+                                 "status": evidence_fields.get("review_status"),
+                                 "credits": paid})})
+                names = list(cols)
+                cur = conn.execute(
+                    f"INSERT INTO evidence({', '.join(names)}) "
+                    f"VALUES({', '.join('?' for _ in names)})",
+                    tuple(cols[n] for n in names))
+                ev_id = cur.lastrowid
+                if paid:
+                    _apply_resources(conn, team, credits=paid, kind="evidence",
+                                     description=f"Experiment result logged: {exp['card_type']}",
+                                     allow_negative=True)
+        updates = dict(exp_updates)
+        if ev_id:
+            updates["evidence_id"] = ev_id
+        sets = ", ".join(f"{k}=?" for k in updates)
+        conn.execute(f"UPDATE experiments SET {sets} WHERE id=? AND team_id=?",
+                     (*updates.values(), exp_id, team_id))
+        conn.commit()
+        return True, "Saved.", ev_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def set_assumption_status(team_id, assum_id, status, source, note=None):
+    """Write an assumption's status with its provenance (team-scoped)."""
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            "UPDATE assumptions SET status=?, status_source=?, status_note=? "
+            "WHERE id=? AND team_id=?", (status, source, note, assum_id, team_id))
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+@run_memo
+def get_assumption(team_id, assum_id):
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT * FROM assumptions WHERE id=? AND team_id=?",
+                           (assum_id, team_id)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+# ---- Frozen round results ------------------------------------------------- #
+def insert_round_result(team_id, round_no, game_id, score, result, config,
+                        rubric_version, source):
+    """Store a finalized round result. Never overwrites (first write wins), so the
+    same finalize running twice — or from two sessions at once — is harmless.
+    Returns True if this call created the row."""
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO round_results(team_id, round, game_id, score, result,
+                   config, rubric_version, source, finalized_at, adjustment, history)
+               VALUES(?,?,?,?,?,?,?,?,?,0,?)""",
+            (team_id, round_no, game_id, score, _dumps(result), _dumps(config),
+             rubric_version, source, now(),
+             _dumps([{"at": now(), "action": "finalized", "source": source,
+                      "score": score}])))
+        conn.commit()
+        return bool(cur.rowcount)
+    finally:
+        conn.close()
+
+
+@run_memo
+def get_round_result(team_id, round_no):
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT * FROM round_results WHERE team_id=? AND round=?",
+                           (team_id, round_no)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["result"] = _loads(d["result"], {})
+        d["config"] = _loads(d["config"], {})
+        d["history"] = _loads(d["history"], [])
+        return d
+    finally:
+        conn.close()
+
+
+def update_round_result(team_id, round_no, action, reason, **fields):
+    """Director correction to a finalized round (recompute or adjustment). Appends an
+    entry to the row's history; the reason is required by the caller."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT history FROM round_results WHERE team_id=? AND round=?"
+                           + (" FOR UPDATE" if IS_PG else ""),
+                           (team_id, round_no)).fetchone()
+        if not row:
+            conn.rollback()
+            return False
+        if "result" in fields:
+            fields["result"] = _dumps(fields["result"])
+        if "config" in fields:
+            fields["config"] = _dumps(fields["config"])
+        fields["history"] = _append_history(row["history"], {
+            "action": action, "reason": reason,
+            **{k: v for k, v in fields.items() if k in ("score", "adjustment")}})
+        sets = ", ".join(f"{k}=?" for k in fields)
+        conn.execute(f"UPDATE round_results SET {sets} WHERE team_id=? AND round=?",
+                     (*fields.values(), team_id, round_no))
+        conn.commit()
+        return True
     finally:
         conn.close()
 
