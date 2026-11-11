@@ -127,7 +127,9 @@ IS_PG = bool(DATABASE_URL)
 
 
 def backend_name():
-    return "Postgres (Neon)" if IS_PG else "SQLite (local file)"
+    if not IS_PG:
+        return "SQLite (local file)"
+    return "Postgres (Neon)" if "neon.tech" in (DATABASE_URL or "") else "Postgres"
 
 
 def get_conn():
@@ -906,7 +908,9 @@ def create_team(name, opportunity="", founder_card=None, capital=2000,
                 hours_per_round=None, game_id=None, roster=None):
     conn = get_conn()
     try:
-        code = secrets.token_hex(3).upper()
+        # 8 hex characters (~4.3 billion codes) for new teams; existing 6-character
+        # codes keep working. Guessing is also rate-limited at the join form.
+        code = secrets.token_hex(4).upper()
         # `founder_hours` here is the per-round time budget; teams start with one
         # round's worth and are topped up each round.
         hpr = hours_per_round if hours_per_round is not None else founder_hours

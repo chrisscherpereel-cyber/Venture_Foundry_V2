@@ -170,6 +170,13 @@ def _mail_settings():
         _mp = logic.mp_job_status(db.active_game_id(), rnd)
         if _mp:
             st.caption(f"Managing Partner notes · Round {rnd}: {_mp}")
+        if logic.mp_job_interrupted(db.active_game_id(), rnd) and logic.ai_available():
+            st.warning("The Managing Partner notes job for this round was interrupted (the app "
+                       "probably restarted). Resuming skips teams that already have their note.")
+            if st.button("▶️ Resume Managing Partner notes", key=f"mp_resume_{rnd}"):
+                logic.send_managing_partner_notes_async(
+                    [t["id"] for t in teams], rnd, db.active_game_id())
+                st.rerun()
 
 
 def _pre_advance_checklist_ui(round_no):
@@ -600,7 +607,7 @@ def schedule():
     st.dataframe(
         [{"Round": s["round"], "Material": s["titles"], "Concepts+objectives (load)": s["load"]}
          for s in summary],
-        use_container_width=True, hide_index=True,
+        width="stretch", hide_index=True,
     )
     if summary:
         sload = [s["load"] for s in summary]
@@ -925,7 +932,7 @@ def round_control():
           "Concepts introduced": ", ".join(r["concepts"]) or "—",
           "Advance at": r["advance_at"] or "—"}
          for r in logic.round_map()],
-        use_container_width=True, hide_index=True,
+        width="stretch", hide_index=True,
     )
 
 
@@ -1007,7 +1014,7 @@ def misconception_radar():
         st.dataframe(
             [{"Concept": c["concept"], "Answered": c["answered"], "Wrong": c["wrong"],
               "Wrong rate": f"{c['wrong_rate']*100:.0f}%"} for c in rep["concepts"]],
-            use_container_width=True, hide_index=True)
+            width="stretch", hide_index=True)
     else:
         st.info("No true/false answers recorded yet — they appear as teams do Concept Checks.")
     st.divider()
@@ -1723,7 +1730,7 @@ def round_scores():
             "Rubric": rs.get("rubric_version") or content.ROUND_RUBRIC_VERSION,
         })
     st.dataframe(sorted(rows, key=lambda r: r["Score /100"], reverse=True),
-                 use_container_width=True, hide_index=True)
+                 width="stretch", hide_index=True)
     st.caption("R1–R5 are criterion levels (0–4); **n/a** = not in play this round (weights "
                "renormalize). Rounds frozen before Stage 2 (rubric rs-1) have no strands.")
     with st.expander("🔍 Why — criterion reasons by team"):
@@ -1837,7 +1844,7 @@ def gradebook_page():
                    "Ratings": r["ratings"], "Round adj. (avg)": r["adjustment"],
                    "Weighted /100": r["weighted"], "Venture bonus": r["venture_bonus"],
                    "Final": r["final"]} for r in rows],
-                 use_container_width=True, hide_index=True)
+                 width="stretch", hide_index=True)
     import csv
     import io
     buf = io.StringIO()
@@ -2131,7 +2138,7 @@ def vp_auction():
               "Alignment": r["alignment"], "Prev": r["prev_alignment"],
               "Tax": r["tax"], "Dividend": r["dividend"], "Net": r["net_credits"]}
              for r in results],
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
         )
     else:
         st.caption("No auction rounds run yet.")
@@ -2178,7 +2185,7 @@ def overview():
             "⚠️ Flagged evidence": flagged, "⏳ In review": in_review,
             "High-risk untested": len(arep["exposed"]), "Experiments": eff["experiments"],
         })
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, width="stretch", hide_index=True)
     st.caption("**Evidence-backed** = how much of the venture's value is earned by evidence "
                "(tested important assumptions + evidence strength); it discounts the valuation, "
                "so early rounds are low by design. **⚠️ Flagged evidence** = items whose wording "
@@ -2203,7 +2210,7 @@ def overview():
         for name, n in cov["counts"].items():
             row[short.get(name, name)] = int(n)   # keep the column numeric (0 = not taken)
         prows.append(row)
-    st.dataframe(prows, use_container_width=True, hide_index=True)
+    st.dataframe(prows, width="stretch", hide_index=True)
     st.caption("A team stuck at a low 'Covered' number (or with all entries in one column) isn't "
                "rotating perspectives — nudge them to vary the lens each round.")
 
@@ -2307,7 +2314,7 @@ def backup_reminder():
                    "database when the app restarts or is updated — download a backup after each "
                    "class.")
     c2.button("Back up now", key="home_backup", on_click=_goto_page,
-              args=("Backup & Restore",), use_container_width=True)
+              args=("Backup & Restore",), width="stretch")
 
 
 def backup_restore():

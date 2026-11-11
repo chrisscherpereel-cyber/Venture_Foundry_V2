@@ -1045,8 +1045,10 @@ def on_round_change(new_round):
                                  description=f"Specialist salaries (round {r})")
             flag = f"round_learning:{gid}:{t['id']}:{r}"
             if db.get_setting(flag) != "1":
+                # Claim the step BEFORE applying it: a crash in between skips one round's
+                # small learning bonus rather than applying it twice (at-most-once).
+                db.set_global_setting(flag, "1")
                 _apply_round_learning(t["id"], r)
-                db.set_setting(flag, "1")
         # (available hours reset lazily via sync_round_hours when a team next loads)
     if gid:
         db.set_game_marker(gid, new_round)
@@ -3469,6 +3471,12 @@ def run_vp_auction(team_id, allocations, round_no):
     result = preview_vp_auction(team_id, allocations)
     if not result.get("ok"):
         return result
+    # One auction per team per round: a double-click or resubmit would otherwise tax
+    # (and re-snapshot) the same allocation twice.
+    if any(r.get("round") == round_no for r in db.list_vp_results(team_id)):
+        return {"ok": False, "committed": False,
+                "reason": f"You've already submitted the auction for Round {round_no}. "
+                          "You can submit again next round."}
 
     props = db.list_value_props(team_id)
     # Snapshot current tokens as prev, then store the new allocation.
@@ -4666,6 +4674,21 @@ def mp_job_status(game_id, round_no):
     return db.get_setting(_mp_job_key(game_id, round_no), "") or ""
 
 
+def _has_mp_note(team_id, round_no):
+    who = content.INVESTOR["name"]
+    return any(m.get("round") == round_no and (m.get("sender") or "").startswith(who)
+               for m in db.list_messages(team_id))
+
+
+def mp_job_interrupted(game_id, round_no):
+    """True when a notes job for this round started but isn't running in this server
+    process any more (e.g. the app restarted part-way) — it can be resumed safely."""
+    status = mp_job_status(game_id, round_no)
+    with _MP_JOBS_GUARD:
+        running = (game_id, round_no) in _MP_JOBS
+    return status.startswith("sending") and not running
+
+
 def send_managing_partner_notes_async(team_ids, round_no, game_id):
     """Queue Managing Partner notes for these teams. Returns how many were queued
     (0 if a job for this game+round is already running)."""
@@ -4684,7 +4707,9 @@ def send_managing_partner_notes_async(team_ids, round_no, game_id):
             db.set_setting(key, f"sending 0/{total}")
             for i, tid in enumerate(team_ids, 1):
                 try:
-                    if send_managing_partner_note(tid, round_no):
+                    if _has_mp_note(tid, round_no):     # resume-safe: skip teams already done
+                        sent += 1
+                    elif send_managing_partner_note(tid, round_no):
                         sent += 1
                 except Exception:      # noqa: BLE001 — one failure mustn't stop the rest
                     pass

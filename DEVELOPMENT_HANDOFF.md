@@ -1,6 +1,6 @@
 # Venture Foundry — Development Handoff
 
-_Last updated: 2026-11-11 · Stage 1 merged into `main` (`5c4a9df`, handoff note `e362e7e`). Pilot-readiness review fixes (`87bd2b9`) merged into `main` on 2026-11-11. Review report: Claude Doc "Venture Foundry V2 — Pilot Readiness Review"._
+_Last updated: 2026-11-11 · `main` = Stage 1 + review fixes (`27e5c08`). **Stage 2 / post-pilot backlog is on `dev/stage2-backlog` — NOT merged.**_
 
 Planning documents (Claude Docs, in the "New Venture Foundry" project):
 - *Venture Foundry V2 — Audit and Development Plan* (audit, backlog B1–B20)
@@ -91,6 +91,58 @@ DATABASE_URL="postgresql://user@host:port/db" pytest -q tests/   # same suite on
 
 Tests added: `tests/test_review_fixes.py` (12). Load-test tool: `tools/load_test.py`.
 
+## Stage 2 — post-pilot backlog (on `dev/stage2-backlog`, not merged)
+
+**Decisions (2026-11-11):**
+- **Venture bonus:** rank tiers (top third +5, middle +2.5, bottom 0).
+- **Simulation:** the instructor enables it per team.
+- **Reflection grade:** half completion, half a sampled read.
+- **Review:** sampled (strength ≥ 7, flagged, near-duplicates, overrides, plus 1 spot check per team per round).
+
+| Backlog item | Built | Where |
+|---|---|---|
+| L22 per-game settings and layout (H1) | Scoped settings keys (`db.GAME_SCOPED_KEYS`, `<key>@g<id>`, global fallback); per-game `game_schedule` and `game_round_topics`, seeded once from the global tables; `set_total_rounds` clamps only the active game | `db.get_setting/set_setting`, `_ensure_game_layout`, schedule/topic helpers |
+| L17 four-strand grade + Gradebook | `grade_strands` (R1–R5 levels with reasons; completion; reflection); per-student `gradebook` with venture bonus tiers and reflection ratings; Gradebook page with CSV; Round Scores shows strands/criteria; students see a "How this round is scored" explainer | `logic.grade_strands/gradebook/venture_bonus_tiers/reflection_sample`, `vi.gradebook_page`, `vs._score_explainer` |
+| L15 sampled review + near-duplicates (M2) | Auto-accept ≤ 6; spot check (`spot_check_item`, seeded and remembered); word-overlap similarity ≥ 0.85 flags `similar_to` | `logic.review_queue/find_similar_evidence` |
+| L19 pitch citations (M5) | Claim blocks cite ledger items (`canvas._cites`); uncited claims warned; traction must cite an accepted behavioral item; feeds R5 | `logic.pitch_citation_report`, `vs._pitch_builder` |
+| L23 first-attempt concepts + quality bar (M7) | `round_answers.first_quiz` kept; radar and grade use the first attempt; "relevant" is now required | `db.set_round_answer`, `logic.answer_quality/_concepts_component/misconception_report` |
+| Join-code limits (M8) | 8-character codes for new teams; per-session and per-process failed-join throttles | `db.create_team`, `app._join_failed` |
+| L5 interpretive strength | Four TBI contrasts plus sample/limitations points, capped by type; LOI ≤ 7; reasons stored and shown, not arithmetic | `logic.interpretive_strength`, evidence form |
+| Assumption-status history (L2) | `assumptions.status_history`; shown on the Assumption Map | `db.set_assumption_status` |
+| Simulation pathway (M6) | Per-team switch on Evidence Review; `simulate_experiment` (seeded, one run, sample from card minimum to 200, % result); origin Simulation, counted but never scored | `logic.simulate_experiment/sim_enabled` |
+| Evidence interpretation field | `evidence.interpretation`, required when linked (form path) | evidence form |
+| Effectuation terminology | Article terms first, nicknames as glosses | Founder & Opportunity, Market Events |
+| Streamlit deprecations (L5) | `use_container_width` → `width`; `components.html` → `st.iframe` | app-wide |
+| Residual flag / MP resume (L4, L1) | Learning step claimed before applying (at most once); MP notes skip teams already noted; Resume button when interrupted | `logic.on_round_change`, `_has_mp_note`, `mp_job_interrupted` |
+| VP auction resubmits | One submission per team per round | `logic.run_vp_auction` |
+| Labels | "Venture Valuation (simulated)"; backend label distinguishes Neon | `vs.dashboard`, `db.backend_name` |
+
+**Not buildable here:** item 10, the live-class performance check. It is in the pilot checklist.
+
+**Tests (2026-11-11):**
+- **SQLite:** 117 passed.
+- **Local Postgres 16:** 115 passed, 2 skipped (SQLite-only).
+- **New file:** `tests/test_stage2.py` (20 tests).
+
+**Load** (35 + 1 users, 2 vCPU, in-process; see `tools/load_test.py`):
+- **SQLite:** writes p50 0.37 s / p95 2.78 s.
+- **Postgres:** writes p50 0.33 s / p95 1.74 s.
+- **Integrity:** 0 lost updates, 0 duplicate versions, 0 negative balances.
+- **Why writes are slower than Stage 1:** each evidence log now runs a near-duplicate check, and canvas saves lock the team row.
+- **Renders:** unchanged and harness-bound.
+
+**Migration:** additive only.
+- **New tables:** `game_schedule`, `game_round_topics`, `reflection_ratings`.
+- **New columns:**
+    - `evidence`: `interpretation`, `strength_dims`, `ladder_strength`, `strength_reasons`, `similar_to`
+    - `assumptions`: `status_history`
+    - `experiments`: `simulated`
+    - `round_answers`: `first_quiz`
+    - `reflections`: `assumption_id`, `changed_mind`
+- **Rounds** frozen under rs-1 keep their old rubric; new freezes use rs-2.
+
+**Rollback:** redeploy `27e5c08`. Old code ignores the new tables and columns. One caveat: per-game settings written after deploy live under `<key>@g<id>` and are ignored by the old code, so a rollback reverts to the deployment-wide settings.
+
 ## Known limitations / unresolved
 - **Experiment-result writes:** evidence and credit are atomic in one transaction. The follow-on assumption-status refresh is a separate write; it is idempotent and is recomputed on the next evidence or result event if it is ever interrupted.
 - **Legacy experiments:** those without numeric thresholds keep a manual outcome, with no override reason required.
@@ -124,6 +176,6 @@ Tests added: `tests/test_review_fixes.py` (12). Load-test tool: `tools/load_test
 - **Deferred:** simulated market, AI personas beyond scripted, file uploads, individual logins.
 
 ## Next recommended task
-0. **First:** run the instructor pilot checklist in the review report (backup, freeze ended rounds, one section per deployment or manual advance).
+0. **First:** review `dev/stage2-backlog` and, if accepted, merge to `main` after a backup. Then run the pilot checklist. With Stage 2 merged, multiple sections can run on their own schedules, so the one-section-per-deployment condition no longer applies.
 
 Stage 2, starting with **L22 / B8 per-game settings**. Schedule, grading and automation settings are global today, so two sections can't run different deadlines or weights. Then **L5 interpretive strength**, which replaces the category-only strength that Stage 1 still uses for new items.

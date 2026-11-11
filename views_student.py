@@ -199,7 +199,7 @@ def _pareto_time_chart(cats):
                           "tooltip": [{"field": "Activity"}, {"field": "Cumulative %"}]}},
         ],
         "resolve": {"scale": {"y": "independent"}},
-    }, use_container_width=True)
+    }, width="stretch")
 
 
 def _shade_row(label, done, must_update):
@@ -1180,7 +1180,7 @@ def _finalized_scores(team):
                          "Automated": rs.get("auto_score", rs["score"]),
                          "Adjustment": rs.get("adjustment", 0) or 0,
                          "Reason": rs.get("adjust_reason") or ""})
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
     _score_explainer(team, cur)
 
 
@@ -1231,7 +1231,7 @@ def dashboard(team):
     st.divider()
     vc1, vc2 = st.columns([1, 2])
     with vc1:
-        st.metric("Venture Valuation", f"${val['valuation']:,.0f}",
+        st.metric("Venture Valuation (simulated)", f"${val['valuation']:,.0f}",
                   help="What your venture is worth RIGHT NOW. A brand-new idea is worth $0 — you "
                        "earn value through the decisions you make and the evidence you gather. "
                        "It grows as you build your model, test assumptions, and log strong evidence.")
@@ -1306,7 +1306,7 @@ def dashboard(team):
                 [{"When": t["created_at"], "Kind": t["kind"], "$": t["money"],
                   "Credits": t["credits"], "Hours": t["hours"], "Note": t["description"]}
                  for t in txns],
-                use_container_width=True, hide_index=True,
+                width="stretch", hide_index=True,
             )
         else:
             st.caption("No transactions yet.")
@@ -1334,7 +1334,7 @@ def _trend_chart(df, cols):
                         {"field": "Metric", "type": "nominal"},
                         {"field": "Value", "type": "quantitative"}],
         },
-    }, use_container_width=True)
+    }, width="stretch")
 
 
 def progress(team):
@@ -1698,7 +1698,8 @@ def _effectuation_panel(team, editable):
     if al["cap"] and al["spent"] > al["cap"] * 0.8:
         st.warning("You're near your affordable-loss ceiling — favour cheaper tests from here.")
 
-    st.markdown("**🧩 Partners & pre-commitments (crazy quilt)**")
+    st.markdown("**🧩 Strategic partnerships — stakeholder pre-commitments** "
+                "*(often nicknamed the \"crazy quilt\")*")
     st.caption(f"Log a self-selected partner or customer who has actually pre-committed — a "
                f"stocking agreement, an intro, a letter of intent. A commitment with evidence "
                f"(an email, a signature, an intro made) earns +{logic.PARTNER_CREDIT} Evidence "
@@ -2943,7 +2944,7 @@ def vp_auction(team):
                   "Alignment": r["alignment"], "Prev": r["prev_alignment"],
                   "Tax": r["tax"], "Dividend": r["dividend"], "Net": r["net_credits"]}
                  for r in results],
-                use_container_width=True, hide_index=True,
+                width="stretch", hide_index=True,
             )
         return
 
@@ -3046,7 +3047,7 @@ def vp_auction(team):
               "Alignment": r["alignment"], "Prev": r["prev_alignment"],
               "Tax": r["tax"], "Dividend": r["dividend"], "Net": r["net_credits"]}
              for r in results],
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
         )
 
 
@@ -3061,13 +3062,14 @@ def market_events(team):
         "Each round the Director introduces a market event — a competitor move, a rule change, "
         "a cost shock. These aren't random punishments: each one targets an assumption hidden "
         "in your canvas. Read the event, find which of your assumptions it threatens, and "
-        "respond by testing, adjusting your model, or filing a pivot. Then try the **lemonade** "
-        "move: turn the surprise into an opportunity.",
+        "respond by testing, adjusting your model, or filing a pivot. Then **leverage the "
+        "contingency** (the \"lemonade\" move): turn the surprise into an opportunity.",
         terms=[
             ("Assumption exposed", "The belief this event puts pressure on. Go check whether "
              "you have evidence for it."),
-            ("Lemonade", "An effectuation principle: leverage surprises and setbacks instead of "
-             "just defending against them."),
+            ("Leveraging contingencies", "An effectuation principle (Sarasvathy): treat "
+             "surprises and setbacks as raw material instead of just defending against them — "
+             "often nicknamed \"lemonade\"."),
             ("Broadcast", "An event sent to all teams at once."),
         ],
     )
@@ -3089,7 +3091,8 @@ def market_events(team):
             if not locked:
                 with st.form(f"exploit_{e['id']}", clear_on_submit=False):
                     txt = st.text_input(
-                        "🍋 Turn this into an opportunity (lemonade)", value=e.get("exploit") or "",
+                        "🍋 Leverage this contingency — turn it into an opportunity (\"lemonade\")",
+                        value=e.get("exploit") or "",
                         help=f"How could this surprise become an advantage? First save earns "
                              f"+{logic.LEMONADE_CREDIT} Evidence Credits.")
                     if st.form_submit_button("Save opportunity play") and txt.strip():

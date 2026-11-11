@@ -17,7 +17,6 @@ Default instructor PIN: foundry  (change it in Director → Round Control).
 import os
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 import db
 import content
@@ -69,7 +68,7 @@ def _sync_active_game():
 def _scroll_top_on_change(state_key, page):
     """Scroll the main pane to the top whenever the selected page changes.
 
-    Streamlit reuses (does not remount) a components.html iframe when its HTML is
+    Streamlit reuses (does not remount) an st.iframe when its HTML is
     byte-for-byte identical across reruns, so an unchanged scroll script would not
     re-execute on the next navigation. We embed a unique NAV TOKEN (the destination
     page + a monotonic counter) so the HTML differs on every navigation, which forces
@@ -78,7 +77,7 @@ def _scroll_top_on_change(state_key, page):
         st.session_state[state_key] = page
         token = st.session_state.get("_nav_token", 0) + 1
         st.session_state["_nav_token"] = token
-        components.html(
+        st.iframe(
             f"<!-- nav:{page}:{token} -->"
             "<script>(function(){var d=window.parent.document;"
             "function top(){['section.main','[data-testid=\"stMain\"]',"
@@ -87,7 +86,7 @@ def _scroll_top_on_change(state_key, page):
             "try{window.parent.scrollTo(0,0);}catch(e){}}"
             # run now and once more after layout settles, then stop (no continuous forcing)
             "top(); window.parent.requestAnimationFrame(top);})();</script>",
-            height=0,
+            height=1,
         )
 
 # --------------------------------------------------------------------------- #
@@ -124,6 +123,27 @@ def _back_to_director():
 # --------------------------------------------------------------------------- #
 # Landing / login
 # --------------------------------------------------------------------------- #
+# Join-code guessing protection: 5 misses in a session → 30 s wait; and, across ALL
+# sessions in this server process, more than 40 misses in a minute → 60 s pause for
+# everyone's failed joins (correct codes entered during a pause must wait too).
+_JOIN_GUARD = {"times": [], "lock_until": 0.0}
+
+
+def _join_failed():
+    import time as _time
+    now_ = _time.time()
+    fails = st.session_state.get("_join_fails", 0) + 1
+    st.session_state["_join_fails"] = fails
+    if fails >= 5:
+        st.session_state["_join_lock_until"] = now_ + 30
+        st.session_state["_join_fails"] = 0
+    g = _JOIN_GUARD
+    g["times"] = [t for t in g["times"] if now_ - t < 60] + [now_]
+    if len(g["times"]) > 40:
+        g["lock_until"] = now_ + 60
+        g["times"] = []
+
+
 def landing():
     branding.header()
     st.markdown(
@@ -140,12 +160,19 @@ def landing():
         st.write("Enter your team join code (issued by the Director).")
         code = st.text_input("Join code", key="join_code_input").strip().upper()
         if st.button("Join", type="primary"):
-            team = db.get_team_by_code(code)
-            if team:
+            import time as _time
+            wait = max(st.session_state.get("_join_lock_until", 0),
+                       _JOIN_GUARD["lock_until"]) - _time.time()
+            team = None if wait > 0 else db.get_team_by_code(code)
+            if wait > 0:
+                st.error(f"Too many attempts — try again in {int(wait) + 1} s.")
+            elif team:
+                st.session_state["_join_fails"] = 0
                 st.session_state.role = "student"
                 st.session_state.team_id = team["id"]
                 st.rerun()
             else:
+                _join_failed()
                 st.error("No team found with that code.")
 
     with tab_instructor:
@@ -232,7 +259,7 @@ def _student_nav(team):
         return page
 
     def _btn(page):
-        st.button(_label(page), key=f"snav_{page}", use_container_width=True,
+        st.button(_label(page), key=f"snav_{page}", width="stretch",
                   type=("primary" if page == cur else "secondary"),
                   on_click=_set_student_page, args=(page,))
 
@@ -305,7 +332,7 @@ def _sidebar_todo(team):
         st.caption(f"👉 **Next:** {nxt['label']}{where}")
         target = STUDENT_PAGE_ALIASES.get(nxt.get("tool"), nxt.get("tool"))
         if target and target in STUDENT_PAGES:
-            st.button(f"Go to {target} ▸", key="todo_next_go", use_container_width=True,
+            st.button(f"Go to {target} ▸", key="todo_next_go", width="stretch",
                       on_click=_set_student_page, args=(target,))
     open_items = [i for i in items if not i["done"]]
     if open_items:
@@ -331,7 +358,7 @@ def _sidebar_commit_status(team):
             st.caption("The deadline has passed — this round is final.")
         else:
             st.success(f"🔒 Round {rnd} committed — editing locked")
-            if st.button("↩️ Withdraw to edit", use_container_width=True,
+            if st.button("↩️ Withdraw to edit", width="stretch",
                          help="Unlock every tool so you can change your work. Re-commit when done."):
                 ok, msg = logic.decommit_round(team["id"], rnd)
                 st.rerun()
@@ -344,7 +371,7 @@ def _sidebar_commit_status(team):
                 st.warning(f"⚠️ Round {rnd} not committed · due in {ds['remaining']}")
             else:
                 st.warning(f"⚠️ Round {rnd} not committed")
-            if st.button("✅ Commit round", type="primary", use_container_width=True,
+            if st.button("✅ Commit round", type="primary", width="stretch",
                          help="Lock in this round's work for scoring. Every tool becomes "
                               "view-only until you withdraw."):
                 ok, msg = logic.commit_round(team["id"], rnd)
@@ -393,7 +420,7 @@ def student_shell():
                 st.caption(f"{pr['icon']} **{pr['name']}** — {pr['lens']}")
         if st.session_state.get("director_viewing") and st.session_state.get("instructor_ok"):
             st.button("↩️ Back to Director console", on_click=_back_to_director,
-                      type="primary", use_container_width=True)
+                      type="primary", width="stretch")
         st.button("Log out", on_click=logout)
 
     _scroll_top_on_change("_student_page", page)
@@ -449,7 +476,7 @@ def _instructor_nav():
     cur = st.session_state.get("instr_page", home)
 
     def _navbtn(page, label=None):
-        st.button(label or page, key=f"navbtn_{page}", use_container_width=True,
+        st.button(label or page, key=f"navbtn_{page}", width="stretch",
                   type=("primary" if page == cur else "secondary"),
                   on_click=_set_instr_page, args=(page,))
 
@@ -486,6 +513,8 @@ def instructor_shell():
         db.set_active_game(gsel)
         _sync_active_game()
         diff = db.get_setting("difficulty", "not set")
+        st.caption("Schedule, grading and automation settings apply to this game (section) "
+                   "only.")
         st.caption(f"Round {db.current_round()} of {logic.total_rounds()} · "
                    f"{len(db.list_teams())} team(s) · Difficulty: {diff}")
         st.divider()
@@ -499,7 +528,7 @@ def instructor_shell():
                                       f"{t['name']} ({t['join_code']})"
                                       for t in teams_here if t["id"] == i))
                 st.button("Open team view", on_click=_director_view_team, args=(vt,),
-                          use_container_width=True)
+                          width="stretch")
         with st.expander("Director's questions"):
             for q in [
                 "What must be true for this to work?",
