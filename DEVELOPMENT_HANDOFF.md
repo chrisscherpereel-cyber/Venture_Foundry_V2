@@ -1,12 +1,12 @@
 # Venture Foundry — Development Handoff
 
-_Last updated: 2026-11-11 · Branch: `dev/stage1-trustworthy-record` (from `main` @ `70f5079`) · **Not merged, not deployed.**_
+_Last updated: 2026-11-11 · Stage 1 merged into `main` (fast-forward to `5c4a9df`) on 2026-11-11; work branch `dev/stage1-trustworthy-record`. If Streamlit Community Cloud deploys from `main`, the live app picks this up on its next rebuild._
 
 Planning documents (Claude Docs, in the "New Venture Foundry" project):
 - *Venture Foundry V2 — Audit and Development Plan* (audit, backlog B1–B20)
 - *Venture Foundry V2 — Learning and Simulation Design* (design spec, rubric, acceptance criteria L1–L26, stages)
 
-## Current milestone — Stage 1 "Trustworthy record" (complete on this branch)
+## Current milestone — Stage 1 "Trustworthy record" (complete, merged to `main`)
 
 The goal: credits, assumption statuses and grades reflect qualified evidence, and a closed round's score can't drift.
 
