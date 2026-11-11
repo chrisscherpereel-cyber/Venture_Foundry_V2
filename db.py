@@ -1676,6 +1676,35 @@ def get_assumption(team_id, assum_id):
         conn.close()
 
 
+# ---- Reflection ratings (sampled instructor reading) ----------------------- #
+def rate_reflection(reflection_id, team_id, rating, note=""):
+    conn = get_conn()
+    try:
+        r = conn.execute("SELECT student_name, round FROM reflections WHERE id=? AND team_id=?",
+                         (reflection_id, team_id)).fetchone()
+        if not r:
+            return False
+        conn.execute(
+            "INSERT INTO reflection_ratings(reflection_id, team_id, student_name, round, rating, "
+            "note, rated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(reflection_id) DO UPDATE SET "
+            "rating=excluded.rating, note=excluded.note, rated_at=excluded.rated_at",
+            (reflection_id, team_id, r["student_name"], r["round"], rating, note, now()))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+@run_memo
+def list_reflection_ratings(team_id):
+    conn = get_conn()
+    try:
+        rows = conn.execute("SELECT * FROM reflection_ratings WHERE team_id=?", (team_id,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 # ---- Frozen round results ------------------------------------------------- #
 def insert_round_result(team_id, round_no, game_id, score, result, config,
                         rubric_version, source):
@@ -1901,12 +1930,14 @@ def add_reflection(team_id, data):
                 data.get("assumption", ""), data.get("overlooked", ""),
                 data.get("differently", ""), data.get("contribution", ""),
                 data.get("focus_prompt", ""), data.get("focus_answer", ""),
-                data.get("perspective", ""), data.get("perspective_note", ""))
+                data.get("perspective", ""), data.get("perspective_note", ""),
+                data.get("assumption_id"), data.get("changed_mind", ""))
         if existing:
             conn.execute(
                 """UPDATE reflections SET expected=?, occurred=?, assumption=?, overlooked=?,
                     differently=?, contribution=?, focus_prompt=?, focus_answer=?,
-                    perspective=?, perspective_note=?, created_at=?
+                    perspective=?, perspective_note=?, assumption_id=?, changed_mind=?,
+                    created_at=?
                    WHERE id=?""",
                 (*vals, now(), existing),
             )
@@ -1914,8 +1945,9 @@ def add_reflection(team_id, data):
             conn.execute(
                 """INSERT INTO reflections(team_id, student_name, round, expected, occurred,
                     assumption, overlooked, differently, contribution, focus_prompt,
-                    focus_answer, perspective, perspective_note, created_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    focus_answer, perspective, perspective_note, assumption_id,
+                    changed_mind, created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (team_id, data.get("student_name", ""), data.get("round", 1), *vals, now()),
             )
         conn.commit()
@@ -2421,6 +2453,20 @@ def set_skill_level(team_id, skill_key, level):
 # Concept-check answers (per team, per round, per concept)
 # --------------------------------------------------------------------------- #
 @run_memo
+@run_memo
+def get_first_quizzes(team_id):
+    """{(round, concept): [first complete true/false picks]} for a team."""
+    conn = get_conn()
+    try:
+        out = {}
+        for r in conn.execute("SELECT round, concept, first_quiz FROM round_answers "
+                              "WHERE team_id=? AND first_quiz IS NOT NULL", (team_id,)).fetchall():
+            out[(r["round"], r["concept"])] = _loads(r["first_quiz"], None)
+        return out
+    finally:
+        conn.close()
+
+
 def _round_answers_by_round(team_id):
     conn = get_conn()
     try:
@@ -2450,14 +2496,32 @@ def get_round_answers(team_id, round_no):
         conn.close()
 
 
+def _complete_quiz(answer):
+    """The true/false picks in a stored concept answer, if every question is answered."""
+    raw = (answer or "").strip()
+    if not raw.startswith("{"):
+        return None
+    try:
+        q = json.loads(raw).get("quiz")
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if isinstance(q, list) and q and all(x is not None for x in q):
+        return _dumps(q)
+    return None
+
+
 def set_round_answer(team_id, round_no, concept, answer):
+    """Save a concept answer. The FIRST complete set of true/false picks is kept in
+    first_quiz and never overwritten, so the Misconception Radar and the grade see
+    the first attempt, not the answer reached after the app said 'not right yet'."""
     conn = get_conn()
     try:
         conn.execute(
-            "INSERT INTO round_answers(team_id, round, concept, answer, created_at) "
-            "VALUES(?,?,?,?,?) ON CONFLICT(team_id, round, concept) "
-            "DO UPDATE SET answer=excluded.answer, created_at=excluded.created_at",
-            (team_id, round_no, concept, answer, now()),
+            "INSERT INTO round_answers(team_id, round, concept, answer, created_at, first_quiz) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(team_id, round, concept) "
+            "DO UPDATE SET answer=excluded.answer, created_at=excluded.created_at, "
+            "first_quiz=COALESCE(round_answers.first_quiz, excluded.first_quiz)",
+            (team_id, round_no, concept, answer, now(), _complete_quiz(answer)),
         )
         conn.commit()
     finally:

@@ -6,6 +6,7 @@ input carries a hover-help (ⓘ) tooltip so a first-time instructor can run the
 whole simulation without a separate manual.
 """
 
+import json
 import random
 from datetime import datetime, date, time
 
@@ -1637,29 +1638,25 @@ def _round_score_email(team, rnd, rs):
 def round_scores():
     st.subheader("🏁 Round Scores (out of 100)")
     _guide(
-        "This gives every team a single automated 0–100 grade for the work they committed in a "
-        "round. It blends up to four things — how much of the round's required work is complete "
-        "(commitment), the strength of their evidence, their business-model coherence, and how "
-        "many of the round's concepts they covered — then subtracts a penalty for important "
-        "assumptions they've left untested. **Only what a team could actually do that round is "
-        "counted:** evidence and coherence are skipped (shown as n/a) until their tools are "
-        "introduced, and the weights renormalize over what's left, so no one is marked down for "
-        "a tool they don't have yet. **Concept answers that align with the team's territory and "
-        "the venture they're building score higher than generic answers.**",
+        "Each team gets a 0–100 round score built from three strands — **reasoning** (60), "
+        "**completion** (25) and **reflection** (15) by default — following the course "
+        "decision of 2026-11-11. Reasoning is the weighted level (0–4) of up to five "
+        "criteria: R1 Claims, R2 Test design, R3 Interpretation, R4 Revision, R5 Pitch "
+        "integrity; a criterion only counts once its tool is in play, and every level shows "
+        "its reasons. Completion is the round's committed checklist plus concept coverage "
+        "(first-attempt weighted). Reflection here is journal completion; your sampled ratings "
+        "are added in the **Gradebook**. These are instructional estimates — adjust any "
+        "finalized round with a reason.",
         steps=[
-            "Set the four component weights (they're normalized, so relative size is what counts).",
-            "Set the strictness dial: left is lenient, right is harsh.",
-            "Pick the round and read the table — each team's score updates live.",
-            "Optionally email any team its score breakdown.",
+            "Set the strand weights for this section (they're normalized).",
+            "Pick the round and read the table; expand a team to see each criterion's reasons.",
+            "Correct a finalized round below if needed (reason required).",
+            "Optionally email a team its breakdown.",
         ],
         terms=[
-            ("Commitment", "Share of the round's decisions + concept-checks completed."),
-            ("Counted this round", "Only components whose tools exist by this round are graded; "
-             "others show n/a and don't lower the score."),
-            ("Alignment", "Concept answers referencing the team's own territory/venture count "
-             "fully; generic answers count partially."),
-            ("Strictness", "A curve on the final score: lenient lifts scores, strict compresses them."),
-            ("Risk penalty", "Points removed for important, still-untested assumptions."),
+            ("Finalized", "Frozen when the round advanced — later work or settings don't change it."),
+            ("Not counted", "A criterion whose tool isn't in play yet; weights renormalize."),
+            ("Venture bonus", "Up to +5 by valuation rank tier in the section — Gradebook only."),
         ],
     )
     teams = db.list_teams()
@@ -1668,36 +1665,24 @@ def round_scores():
         return
 
     cfg = logic.get_round_score_config()
+    gcfg = logic.get_grade_config()
 
-    # ---- Sensitivity controls ------------------------------------------------
-    st.markdown("### 🎚️ Scoring sensitivity")
-    labels = {"commitment": "Commitment / completion", "evidence": "Evidence quality",
-              "coherence": "Model coherence", "concepts": "Concept coverage",
-              "ai_verification": "AI verification"}
-    with st.form("round_score_cfg"):
-        cols = st.columns(len(logic.ROUND_SCORE_COMPONENTS))
-        new_w = {}
-        for i, k in enumerate(logic.ROUND_SCORE_COMPONENTS):
-            hlp = ("Rewards actually EVALUATING AI use (verified/rejected/modified), not just "
-                   "logging it. Only counts once a team has used AI."
-                   if k == "ai_verification" else f"Relative weight of {labels[k].lower()}.")
-            new_w[k] = cols[i].slider(labels[k], 0, 100, int(cfg["weights"][k]), help=hlp)
-        strict = st.slider(
-            "Strictness (← lenient · harsh →)", 0, 100, int(cfg["strictness"]),
-            help="50 is neutral. Below 50 lifts scores (forgiving); above 50 makes high "
-                 "scores harder to reach (demanding).")
-        wsum = sum(new_w.values()) or 1
-        st.caption("Normalized weights: " + " · ".join(
-            f"{labels[k]} {100*new_w[k]/wsum:.0f}%" for k in logic.ROUND_SCORE_COMPONENTS))
-        c1, c2 = st.columns(2)
-        if c1.form_submit_button("Save sensitivity", help="Apply these settings to all scores."):
-            logic.set_round_score_config(new_w, strict)
-            st.success("Saved.")
+    # ---- Strand weights (per section) --------------------------------------
+    st.markdown("### 🎚️ Strand weights (this section)")
+    with st.form("grade_weights"):
+        c1, c2, c3 = st.columns(3)
+        wr = c1.number_input("Reasoning", 0, 100, int(gcfg["weights"]["reasoning"]))
+        wc = c2.number_input("Completion", 0, 100, int(gcfg["weights"]["completion"]))
+        wf = c3.number_input("Reflection", 0, 100, int(gcfg["weights"]["reflection"]))
+        b1, b2 = st.columns(2)
+        if b1.form_submit_button("Save weights"):
+            logic.set_grade_config({"reasoning": wr, "completion": wc, "reflection": wf})
             st.rerun()
-        if c2.form_submit_button("Reset to defaults"):
-            d = logic.default_round_score_config()
-            logic.set_round_score_config(d["weights"], d["strictness"])
+        if b2.form_submit_button("Reset to 60 / 25 / 15"):
+            logic.set_grade_config(content.GRADE_WEIGHTS)
             st.rerun()
+    st.caption("Changes apply to rounds that are still open; finalized rounds keep the weights "
+               "they were frozen with.")
 
     # ---- Scores table --------------------------------------------------------
     st.markdown("### 📋 Scores")
@@ -1721,7 +1706,8 @@ def round_scores():
     for t in teams:
         rs = logic.round_score(t["id"], rnd, cfg)
         scored[t["id"]] = rs
-        c = rs["components"]
+        sd = rs.get("strands") or {}
+        crit = sd.get("criteria") or {}
         rows.append({
             "Team": t["name"],
             "Status": "🔒 Finalized" if rs.get("finalized") else "Live",
@@ -1729,21 +1715,24 @@ def round_scores():
             "Adj.": rs.get("adjustment", 0) or 0,
             "Grade": rs["grade"],
             "Commit": "✅" if rs["committed"] else "—",
-            "Completion": _cell(c["commitment"]),
-            "Evidence": _cell(c["evidence"]),
-            "Coherence": _cell(c["coherence"]),
-            "Concepts": _cell(c["concepts"]),
-            "AI verify": _cell(c["ai_verification"]),
-            "Risk −": rs["penalty"],
+            "Reasoning": _cell(sd.get("reasoning")),
+            "Completion": _cell(sd.get("completion")),
+            "Reflection": _cell(sd.get("reflection")),
+            **{code: (crit[code]["level"] if code in crit else "n/a")
+               for code, _n, _w in logic.REASONING_CRITERIA},
+            "Rubric": rs.get("rubric_version") or content.ROUND_RUBRIC_VERSION,
         })
     st.dataframe(sorted(rows, key=lambda r: r["Score /100"], reverse=True),
                  use_container_width=True, hide_index=True)
-    _counted = logic.round_score_available(rnd)
-    _off = [k for k, v in _counted.items() if not v]
-    if _off:
-        st.caption("**n/a** = a component isn't graded this round because its tool isn't "
-                   "introduced yet, so teams aren't marked down for it. Not counted in Round "
-                   f"{rnd}: " + ", ".join(_off) + ". (Weights are renormalized over what counts.)")
+    st.caption("R1–R5 are criterion levels (0–4); **n/a** = not in play this round (weights "
+               "renormalize). Rounds frozen before Stage 2 (rubric rs-1) have no strands.")
+    with st.expander("🔍 Why — criterion reasons by team"):
+        for t in teams:
+            sd = scored[t["id"]].get("strands") or {}
+            st.markdown(f"**{t['name']}** — reasoning {sd.get('reasoning', 'n/a')}, "
+                        f"completion {sd.get('completion', 'n/a')}, reflection {sd.get('reflection', 'n/a')}")
+            for code, c in (sd.get("criteria") or {}).items():
+                st.caption(f"{code} {c['name']} — level {c['level']}/4: " + "; ".join(c["reasons"]))
     if any(v.get("finalized") for v in scored.values()):
         st.caption("🔒 **Finalized** rounds show the score saved when the round closed — later "
                    "work and the sensitivity settings above don't change them. To correct one, "
@@ -1820,6 +1809,81 @@ def round_scores():
 
 
 # --------------------------------------------------------------------------- #
+# Gradebook — course-level grade per student (decided 2026-11-11):
+#   reasoning 60 / completion 25 / reflection 15 + venture bonus up to 5 (rank tier).
+# --------------------------------------------------------------------------- #
+def gradebook_page():
+    st.subheader("📒 Gradebook")
+    _guide(
+        "One row per student. **Reasoning** and **completion** are the team's averages over "
+        "finished (frozen) rounds; **reflection** is the student's own: half journal "
+        "completion (entries tied to an assumption count fully) and half your ratings of a "
+        "sampled entry every few rounds. **Weighted** applies this section's strand weights "
+        "(Round Scores page). The **venture bonus** adds up to 5 points by the team's "
+        "simulated valuation rank in the section (top third +5, middle +2.5, bottom 0). All "
+        "automated parts are instructional estimates you can adjust per round with a reason.",
+        steps=["Rate the sampled journal entries below (Beginning / Proficient / Exemplary).",
+               "Review the table; adjust any round on Round Scores if needed.",
+               "Download the CSV for your LMS."],
+    )
+    rows = logic.gradebook()
+    if not rows:
+        st.info("No teams yet.")
+        return
+    if all(r["rounds"] == 0 for r in rows):
+        st.info("No round has finished yet — the gradebook fills in as rounds are frozen.")
+    st.dataframe([{"Team": r["team"], "Student": r["student"], "Reasoning": r["reasoning"],
+                   "Completion": r["completion"], "Reflection": r["reflection"],
+                   "Ratings": r["ratings"], "Round adj. (avg)": r["adjustment"],
+                   "Weighted /100": r["weighted"], "Venture bonus": r["venture_bonus"],
+                   "Final": r["final"]} for r in rows],
+                 use_container_width=True, hide_index=True)
+    import csv
+    import io
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+    w.writeheader()
+    w.writerows(rows)
+    st.download_button("⬇️ Download gradebook (CSV)", buf.getvalue().encode("utf-8"),
+                       file_name=f"gradebook_game{db.active_game_id()}.csv", mime="text/csv")
+
+    st.divider()
+    st.markdown("### 📝 Reflection reading (sampled)")
+    st.caption(f"Rate one entry per student per {content.REFLECTION_SAMPLE_EVERY} rounds — the "
+               "latest entry in each block is suggested. Ratings feed half of each student's "
+               "reflection strand.")
+    cur = db.current_round()
+    teams = db.list_teams()
+    team = st.selectbox("Team", teams, format_func=lambda t: t["name"], key="gb_team")
+    ratings = {r["reflection_id"]: r for r in db.list_reflection_ratings(team["id"])}
+    names = logic.team_member_names(team) or sorted(
+        {r["student_name"] for r in db.list_reflections(team["id"]) if r.get("student_name")})
+    if not names:
+        st.caption("No journal entries yet.")
+    for nm in names:
+        for r in logic.reflection_sample(team["id"], nm, cur):
+            done = ratings.get(r["id"])
+            with st.expander(f"{nm} · Round {r['round']}"
+                             + (f" · rated {done['rating']}" if done else " · not rated")):
+                for lbl, k in (("Expected", "expected"), ("What happened", "occurred"),
+                               ("Changed my mind?", "changed_mind"),
+                               ("Do differently", "differently"), ("Contribution", "contribution")):
+                    if (r.get(k) or "").strip():
+                        st.write(f"**{lbl}:** {r[k]}")
+                if r.get("assumption_id"):
+                    a = db.get_assumption(team["id"], r["assumption_id"])
+                    st.caption(f"About assumption: {(a or {}).get('text', '?')}")
+                opts = list(content.REFLECTION_RATINGS)
+                pick = st.radio("Rating", opts, horizontal=True, key=f"gb_r_{r['id']}",
+                                index=opts.index(done["rating"]) if done else 1)
+                note = st.text_input("Note (optional)", value=(done or {}).get("note") or "",
+                                     key=f"gb_n_{r['id']}")
+                if st.button("Save rating", key=f"gb_s_{r['id']}"):
+                    db.rate_reflection(r["id"], team["id"], pick, note)
+                    st.rerun()
+
+
+# --------------------------------------------------------------------------- #
 # Evidence Review — the short weekly queue that releases (or withholds) credit for
 # strong or flagged evidence claims, plus assumption-status overrides.
 # --------------------------------------------------------------------------- #
@@ -1869,13 +1933,16 @@ def evidence_review():
         st.info("No teams yet. Create teams on the Team Setup page first.")
         return
     by_id = {t["id"]: t for t in teams}
-    queue = logic.review_queue([t["id"] for t in teams])
-    st.metric("Waiting for review", len(queue))
+    queue = logic.review_queue([t["id"] for t in teams], db.current_round())
+    st.metric("Waiting for review", len(queue),
+              help="Strength 7+ claims, flagged wording, possible duplicates, overridden "
+                   "experiment outcomes, plus one random spot-check per team this round.")
     flash = st.session_state.pop("_rev_flash", None)
     if flash:
         st.success(flash)
 
     unflagged = [e for e in queue if e["review_status"] == "Pending review"
+                 and not e.get("similar_to")
                  and not logic.evidence_flags(e["description"], e["source"], e["strength"])
                  and not (e.get("source") or "").startswith("Experiment #")]
     if unflagged:
@@ -1896,9 +1963,18 @@ def evidence_review():
         if not t:
             continue
         efl = logic.evidence_flags(e["description"], e["source"], e["strength"])
-        with st.expander(f"{'⚠️' if efl else '•'} {t['name']} · #{e['id']} · "
+        with st.expander(f"{'🎲' if e.get('_spot_check') else '⚠️' if efl else '•'} "
+                         f"{t['name']} · #{e['id']} · "
                          f"[{e['strength']}/10] {e['description'][:70]}"
+                         + (" · spot check" if e.get("_spot_check") else "")
                          + (" · needs artifact" if e["review_status"] == "Needs artifact" else "")):
+            if e.get("_spot_check"):
+                st.caption("🎲 Random spot-check of an auto-accepted item (already paid). Accept "
+                           "if it holds up; downgrade or mark duplicate if not.")
+            if e.get("similar_to"):
+                sim = db.get_evidence(t["id"], e["similar_to"])
+                st.warning(f"Possible duplicate of #{e['similar_to']}: "
+                           f"“{(sim or {}).get('description', '?')[:90]}”")
             st.write(f"**Type:** {e['evidence_type']}  ·  **Who / context:** {e['source'] or '—'}"
                      + (f"  ·  **n =** {e['sample_n']}" if e.get("sample_n") else "")
                      + (f"  ·  **Collected:** {e['collected_on']}" if e.get("collected_on") else "")
@@ -1907,7 +1983,15 @@ def evidence_review():
                 a = db.get_assumption(t["id"], e["assumption_id"])
                 st.write(f"**Assumption:** {(a or {}).get('text', '?')} — "
                          f"*{e.get('direction') or 'no direction'}*")
+            if e.get("interpretation"):
+                st.write(f"**Interpretation:** {e['interpretation']}")
             st.write(f"**Team's justification:** {e.get('justification') or '—'}")
+            if e.get("strength_reasons"):
+                try:
+                    st.caption("Strength reasons (from the team's four answers): "
+                               + "; ".join(json.loads(e["strength_reasons"])))
+                except (ValueError, TypeError):
+                    pass
             if e.get("limitations"):
                 st.write(f"**Limitations:** {e['limitations']}")
             for f in efl:
@@ -1937,6 +2021,21 @@ def evidence_review():
                 ok, msg, d = logic.review_evidence(t["id"], e["id"], "duplicate", note)
                 st.session_state["_rev_flash"] = f"#{e['id']}: {msg} ({d:+g} credits)" if ok else None
                 (st.rerun() if ok else st.error(msg))
+
+    st.divider()
+    st.markdown("### 🧪 Simulation pathway (per team)")
+    st.caption("For teams that can't reach real customers in time. Enabled teams get a "
+               "'Simulated run' on each experiment: results are generated from hidden "
+               "territory parameters, labelled SIMULATION everywhere, can't be re-rolled, and "
+               "count toward assumptions and venture value — never toward reasoning-quality "
+               "evidence scores.")
+    scols = st.columns(min(4, len(teams)) or 1)
+    for i, t in enumerate(teams):
+        on = logic.sim_enabled(t["id"])
+        new = scols[i % len(scols)].checkbox(t["name"], value=on, key=f"sim_on_{t['id']}")
+        if new != on:
+            logic.set_sim_enabled(t["id"], new)
+            st.rerun()
 
     st.divider()
     st.markdown("### Assumption status overrides")

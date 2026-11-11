@@ -421,8 +421,11 @@ def answer_quality(text, concept="", team_id=None):
     checks["relevant"] = bool(uniq & ctx) or bool(uniq & cwords)
     checks["evidence_based"] = bool(uniq & _ANSWER_EVIDENCE_WORDS)
     substance = (checks["uses_concepts"] + checks["relevant"] + checks["evidence_based"])
-    # Pass = a real, on-topic sentence: complete + meaningful + at least one substance signal.
-    ok = checks["complete"] and checks["meaningful"] and substance >= 1
+    # Pass = a real, on-topic sentence: complete + meaningful + RELEVANT (to the concept
+    # or the team's venture) + at least one more substance signal. (Raised in Stage 2:
+    # a string of course vocabulary alone no longer passes.)
+    ok = (checks["complete"] and checks["meaningful"] and checks["relevant"]
+          and (checks["uses_concepts"] or checks["evidence_based"]))
     return {"ok": ok, "checks": checks, "passed": sum(checks.values()), "total": 5,
             "feedback": _quality_feedback(checks)}
 
@@ -2808,6 +2811,31 @@ def pitch_canvas_autofill(team_id):
     return out
 
 
+PITCH_CLAIM_BLOCKS = ["pain_gain", "product", "unique", "traction", "business_model"]
+
+
+def pitch_citation_report(team_id):
+    """How well the pitch's claim blocks are backed by the team's evidence ledger.
+    None if the team has no pitch yet. A cited item counts if it is still counted
+    evidence (not withdrawn/duplicate/practice); traction additionally needs an
+    ACCEPTED behavioral item (strength 6+)."""
+    canvas = db.get_pitch_canvas(team_id)
+    if not canvas:
+        return None
+    cites = canvas.get("_cites") or {}
+    counted = {e["id"]: e for e in db.list_counted_evidence(team_id)}
+    filled = [k for k in PITCH_CLAIM_BLOCKS if (canvas.get(k) or "").strip()]
+    cited = [k for k in filled if any(int(i) in counted for i in (cites.get(k) or []))]
+    tr_ids = [int(i) for i in (cites.get("traction") or []) if int(i) in counted]
+    tr_ok = any((counted[i]["strength"] or 0) >= 6 and counted[i].get("origin") in db.REAL_ORIGINS
+                and (counted[i].get("review_status") is None or evidence_is_qualified(counted[i]))
+                for i in tr_ids)
+    return {"filled_claim_blocks": filled, "cited_blocks": cited,
+            "uncited": [k for k in filled if k not in cited],
+            "cited_share": (len(cited) / len(filled)) if filled else 0.0,
+            "traction_filled": "traction" in filled, "traction_qualified": tr_ok}
+
+
 def pitch_canvas_score(canvas):
     """How complete the Pitch Canvas is, overall and on the core blocks."""
     canvas = canvas or {}
@@ -2948,11 +2976,13 @@ def misconception_report(game_id=None):
                 if not content.CONCEPT_QUIZ.get(c):
                     continue
                 parsed = _parse_concept_response(raw)
-                if parsed["quiz"] is None:
+                first = db.get_first_quizzes(t["id"]).get((r, c))
+                quiz = first if first is not None else parsed["quiz"]
+                if quiz is None:
                     continue
                 s = stats.setdefault(c, {"answered": 0, "wrong": 0})
                 s["answered"] += 1
-                if not concept_quiz_correct(c, parsed["quiz"]):
+                if not concept_quiz_correct(c, quiz):    # FIRST attempt
                     s["wrong"] += 1
     concepts = [{"concept": c, "answered": s["answered"], "wrong": s["wrong"],
                  "wrong_rate": (s["wrong"] / s["answered"] if s["answered"] else 0)}
@@ -3665,7 +3695,9 @@ def _concepts_component(team_id, rnd):
             continue
         stt = concept_answer_status(team_id, rnd, c["concept"], answers)
         if stt["done"]:
-            score_sum += 1.0                    # complete, quality answer + correct quiz
+            first = db.get_first_quizzes(team_id).get((rnd, c["concept"]))
+            first_ok = first is None or concept_quiz_correct(c["concept"], first)
+            score_sum += 1.0 if first_ok else 0.7   # right only after the app said "not yet"
             answered += 1
             if stt["quality"]["checks"]["relevant"]:
                 aligned += 1
@@ -3768,6 +3800,308 @@ def round_score(team_id, rnd, config=None, live=False):
     return res
 
 
+# --------------------------------------------------------------------------- #
+# Stage 2 grade — three strands, decided 2026-11-11: reasoning 60 / completion 25 /
+# reflection 15 (per-game editable), plus a venture-outcomes bonus of up to 5 points
+# by rank tier within the section. Every criterion level comes with plain-language
+# reasons. These are INSTRUCTIONAL ESTIMATES from the record, not validated
+# measures of learning; the instructor can adjust any frozen round with a reason.
+# --------------------------------------------------------------------------- #
+REASONING_CRITERIA = [("R1", "Claims", 20), ("R2", "Test design", 25),
+                      ("R3", "Interpretation", 25), ("R4", "Revision", 20),
+                      ("R5", "Pitch integrity", 10)]
+
+
+def get_grade_config():
+    cfg = {"weights": dict(content.GRADE_WEIGHTS)}
+    raw = db.get_setting("grade_config")
+    if raw:
+        try:
+            saved = json.loads(raw)
+            for k in cfg["weights"]:
+                if k in saved.get("weights", {}):
+                    cfg["weights"][k] = float(saved["weights"][k])
+        except (ValueError, TypeError, AttributeError):
+            pass
+    return cfg
+
+
+def set_grade_config(weights):
+    db.set_setting("grade_config", json.dumps(
+        {"weights": {k: float(weights.get(k, v)) for k, v in content.GRADE_WEIGHTS.items()}}))
+
+
+def _upto(rows, rnd, col="round"):
+    """Rows created by the end of round rnd (legacy rows without a round count)."""
+    return [r for r in rows if r.get(col) is None or r.get(col) <= rnd]
+
+
+def _specific(text):
+    t = text or ""
+    return len(t.split()) >= 6 and bool(re.search(r"\d|%|\$", t))
+
+
+def _crit_claims(team_id, rnd):
+    if page_unlock_round("Assumption Map") > rnd:
+        return None
+    assums = _upto(db.list_assumptions(team_id), rnd, "round_created")
+    if not assums:
+        return 0, ["No assumptions written yet."]
+    imp = [a for a in assums if (a["importance"] or 0) >= 4] or assums
+    spec = sum(1 for a in imp if _specific(a["text"])) / len(imp)
+    ranked = len({a["importance"] for a in assums}) > 1
+    reasons = [f"{len(assums)} assumption(s) written",
+               f"{spec*100:.0f}% of the important ones are specific (who, what, how much)",
+               "importance is ranked" if ranked else "all assumptions have the same importance"]
+    lvl = 1
+    if len(assums) >= 3:
+        lvl = 2
+        if spec >= 0.5:
+            lvl = 3
+            if spec >= 0.8 and ranked:
+                lvl = 4
+    return lvl, reasons
+
+
+def _exp_quality(e):
+    q, why = 0, []
+    if e.get("success_value") is not None and e.get("failure_value") is not None:
+        q += 1
+    else:
+        why.append("no numeric thresholds")
+    if e.get("predicted_outcome") and e.get("confidence") is not None:
+        q += 1
+    else:
+        why.append("no prediction")
+    if len((e.get("decision_rule") or "").split()) >= 5:
+        q += 1
+    else:
+        why.append("decision rule too thin")
+    if (e.get("metric") or "").strip() and len((e.get("hypothesis") or "").split()) >= 8:
+        q += 1
+    else:
+        why.append("hypothesis or metric too thin")
+    if e.get("override_reason"):
+        q = max(0, q - 1)
+        why.append("outcome overridden against its own thresholds")
+    return q, why
+
+
+def _crit_tests(team_id, rnd):
+    if page_unlock_round("Experiment Marketplace") > rnd:
+        return None
+    exps = _upto(db.list_experiments(team_id), rnd)
+    if not exps:
+        return 0, ["No experiment designed yet."]
+    this = [e for e in exps if e.get("round") == rnd] or exps
+    qs = [_exp_quality(e) for e in this]
+    lvl = round(sum(q for q, _ in qs) / len(qs))
+    gaps = sorted({w for _, why in qs for w in why})
+    return lvl, [f"{len(this)} experiment(s) assessed"] + (
+        ["gaps: " + ", ".join(gaps)] if gaps else ["thresholds, prediction, decision rule and "
+                                                     "hypothesis all present"])
+
+
+def _crit_interpretation(team_id, rnd):
+    if page_unlock_round("Evidence Ledger") > rnd:
+        return None
+    items = [e for e in db.list_evidence(team_id)
+             if e.get("round") == rnd and e.get("origin") in db.REAL_ORIGINS
+             and e.get("review_status") not in ("Withdrawn", "Practice")]
+    if not items:
+        return 0, ["No real-world evidence logged this round."]
+    total, notes = 0.0, {"downgraded": 0, "duplicate": 0}
+    for e in items:
+        if e.get("review_status") == "Duplicate":
+            notes["duplicate"] += 1
+            continue
+        q = 0
+        q += len((e.get("justification") or "").split()) >= 5
+        q += bool((e.get("source") or "").strip())
+        q += bool(e.get("sample_n") or (e.get("limitations") or "").strip())
+        q += bool((e.get("interpretation") or "").strip()) if e.get("assumption_id") \
+            else len((e.get("justification") or "").split()) >= 10
+        if e.get("review_status") == "Downgraded":
+            q = max(0, q - 1)
+            notes["downgraded"] += 1
+        total += q
+    lvl = round(total / len(items))
+    reasons = [f"{len(items)} item(s) logged this round"]
+    if notes["downgraded"]:
+        reasons.append(f"{notes['downgraded']} downgraded in review")
+    if notes["duplicate"]:
+        reasons.append(f"{notes['duplicate']} marked duplicate")
+    reasons.append("judged on: justification, who/context, sample or limitations, "
+                   "interpretation kept separate")
+    return lvl, reasons
+
+
+def _crit_revision(team_id, rnd):
+    if page_unlock_round("Experiment Marketplace") > rnd:
+        return None
+    resolved = [e for e in db.list_experiments(team_id)
+                if e["outcome"] in ("Supported", "Refuted", "Inconclusive")
+                and (e.get("result_round") or 0) <= rnd]
+    if not resolved:
+        return None                      # nothing to revise yet — not counted
+    decided = sum(1 for e in resolved if (e.get("decision") or "").strip()) / len(resolved)
+    refuted = [e for e in resolved if e["outcome"] == "Refuted"]
+    reasons = [f"decision recorded for {decided*100:.0f}% of resolved tests"]
+    if refuted:
+        pivots = db.list_pivots(team_id)
+        canv = db.list_canvases(team_id)
+        followed = 0
+        for e in refuted:
+            rr = e.get("result_round") or 0
+            if ((e.get("decision") or "").startswith(("Pivot", "Run a stronger", "Stop"))
+                    or any((p.get("round") or 0) >= rr for p in pivots)
+                    or any((c.get("round") or 0) >= rr for c in canv)):
+                followed += 1
+        share = followed / len(refuted)
+        reasons.append(f"{followed} of {len(refuted)} refuted result(s) followed by a change "
+                       "(pivot, stronger test, or model revision)")
+        lvl = round(4 * (0.5 * decided + 0.5 * share))
+    else:
+        lvl = round(4 * decided)
+    return lvl, reasons
+
+
+def _crit_pitch(team_id, rnd):
+    rep_ = pitch_citation_report(team_id)
+    if rep_ is None or rnd < page_unlock_round("Demo Day"):
+        return None
+    filled = rep_["filled_claim_blocks"]
+    if not filled:
+        return 0, ["Pitch claim blocks are empty."]
+    share = rep_["cited_share"]
+    lvl = round(4 * share)
+    reasons = [f"{share*100:.0f}% of filled claim blocks cite evidence"]
+    if rep_["traction_filled"] and not rep_["traction_qualified"]:
+        lvl = min(lvl, 2)
+        reasons.append("traction isn't backed by accepted behavioral evidence")
+    return lvl, reasons
+
+
+def _reflection_completion(team_id, rnd):
+    team = db.get_team(team_id) or {}
+    members = team_member_names(team)
+    entries = [r for r in db.list_reflections(team_id) if r.get("round") == rnd]
+    expected = max(1, len(members))
+    linked = sum(1.0 if r.get("assumption_id") else 0.5 for r in entries)
+    share = min(1.0, linked / expected)
+    return 100.0 * share, [f"{len(entries)} journal entr{'y' if len(entries) == 1 else 'ies'} "
+                           f"for {expected} member(s); entries tied to an assumption count fully"]
+
+
+def grade_strands(team_id, rnd, completion_commitment):
+    """The three strands for one team-round, each with reasons. Reasoning = weighted
+    R1–R5 levels (only criteria in play that round); completion = commitment +
+    concept coverage (first-attempt weighted); reflection = journal completion (the
+    instructor's sampled ratings are added at course level in the Gradebook)."""
+    crits = {}
+    for code, name, w in REASONING_CRITERIA:
+        fn = {"R1": _crit_claims, "R2": _crit_tests, "R3": _crit_interpretation,
+              "R4": _crit_revision, "R5": _crit_pitch}[code]
+        res = fn(team_id, rnd)
+        if res is not None:
+            lvl, why = res
+            crits[code] = {"name": name, "weight": w, "level": int(max(0, min(4, lvl))),
+                           "reasons": why}
+    if crits:
+        wsum = sum(c["weight"] for c in crits.values())
+        reasoning = 100.0 * sum(c["weight"] * c["level"] / 4 for c in crits.values()) / wsum
+    else:
+        reasoning = None
+    conc, _a, _al, _tot = _concepts_component(team_id, rnd)
+    completion = (completion_commitment + conc) / 2
+    refl, refl_why = _reflection_completion(team_id, rnd)
+    cfg = get_grade_config()["weights"]
+    parts = {"reasoning": reasoning, "completion": completion, "reflection": refl}
+    used = {k: v for k, v in parts.items() if v is not None}
+    wsum = sum(cfg[k] for k in used) or 1
+    total = sum(cfg[k] * used[k] for k in used) / wsum
+    return {"reasoning": None if reasoning is None else round(reasoning, 1),
+            "completion": round(completion, 1), "reflection": round(refl, 1),
+            "reflection_reasons": refl_why, "criteria": crits,
+            "weights": cfg, "total": round(total, 1)}
+
+
+def venture_bonus_tiers(game_id=None):
+    """Bonus points by valuation rank within the section: top third / middle / bottom
+    (content.VENTURE_BONUS_TIERS). Simulated venture value only — shown separately."""
+    gid = game_id if game_id is not None else db.active_game_id()
+    teams = db.list_teams(gid)
+    vals = sorted(((compute_valuation(t["id"])["valuation"], t["id"]) for t in teams),
+                  reverse=True)
+    n = len(vals)
+    out = {}
+    for i, (_v, tid) in enumerate(vals):
+        tier = 0 if i < -(-n // 3) else (1 if i < -(-2 * n // 3) else 2)
+        out[tid] = content.VENTURE_BONUS_TIERS[tier]
+    return out
+
+
+def reflection_sample(team_id, student_name, upto_round):
+    """Which of a student's entries the instructor should rate: one per block of
+    REFLECTION_SAMPLE_EVERY rounds (the latest entry in each block)."""
+    k = content.REFLECTION_SAMPLE_EVERY
+    entries = [r for r in db.list_reflections(team_id)
+               if r.get("student_name") == student_name and (r.get("round") or 0) <= upto_round]
+    blocks = {}
+    for r in entries:
+        b = ((r.get("round") or 1) - 1) // k
+        if b not in blocks or (r.get("round") or 0) > (blocks[b].get("round") or 0):
+            blocks[b] = r
+    return [blocks[b] for b in sorted(blocks)]
+
+
+def gradebook(game_id=None):
+    """Course-level grade per STUDENT (team strands + own reflection), using the frozen
+    results of every finished round. Returns rows with all parts and reasons."""
+    gid = game_id if game_id is not None else db.active_game_id()
+    g = db.get_game(gid) if gid else None
+    cur = int(g["current_round"]) if g else db.current_round()
+    bonus = venture_bonus_tiers(gid)
+    cfg = get_grade_config()["weights"]
+    rows = []
+    for t in db.list_teams(gid):
+        frozen = [round_score(t["id"], r) for r in range(1, cur)]
+        strands = [f.get("strands") or {} for f in frozen]
+        reas = [s["reasoning"] for s in strands if s.get("reasoning") is not None]
+        comp = [s["completion"] for s in strands if s.get("completion") is not None]
+        team_reasoning = sum(reas) / len(reas) if reas else None
+        team_completion = sum(comp) / len(comp) if comp else None
+        adjust = sum((f.get("adjustment") or 0) for f in frozen) / len(frozen) if frozen else 0
+        members = team_member_names(t) or sorted({r["student_name"] for r in db.list_reflections(t["id"])
+                                                  if r.get("student_name")}) or ["(team)"]
+        ratings = {r["reflection_id"]: r for r in db.list_reflection_ratings(t["id"])}
+        for m in members:
+            mine = [r for r in db.list_reflections(t["id"])
+                    if r.get("student_name") == m and (r.get("round") or 0) < cur]
+            rounds = max(1, cur - 1)
+            done = sum(1.0 if r.get("assumption_id") else 0.5 for r in mine)
+            refl_completion = 100.0 * min(1.0, done / rounds)
+            rated = [content.REFLECTION_RATINGS.get(ratings[r["id"]]["rating"])
+                     for r in mine if r["id"] in ratings]
+            rated = [x for x in rated if x is not None]
+            refl = (0.5 * refl_completion + 0.5 * (sum(rated) / len(rated))) if rated \
+                else refl_completion
+            parts = {"reasoning": team_reasoning, "completion": team_completion, "reflection": refl}
+            used = {k: v for k, v in parts.items() if v is not None}
+            wsum = sum(cfg[k] for k in used) or 1
+            base = sum(cfg[k] * used[k] for k in used) / wsum + adjust
+            rows.append({"team": t["name"], "team_id": t["id"], "student": m,
+                         "reasoning": None if team_reasoning is None else round(team_reasoning, 1),
+                         "completion": None if team_completion is None else round(team_completion, 1),
+                         "reflection": round(refl, 1), "ratings": len(rated),
+                         "adjustment": round(adjust, 1),
+                         "weighted": round(max(0.0, min(100.0, base)), 1),
+                         "venture_bonus": bonus.get(t["id"], 0.0),
+                         "final": round(max(0.0, min(100.0, base)) + bonus.get(t["id"], 0.0), 1),
+                         "rounds": cur - 1})
+    return rows
+
+
 def _live_round_score(team_id, rnd, config=None):
     """Return a 0–100 round score with its component breakdown.
 
@@ -3831,8 +4165,13 @@ def _live_round_score(team_id, rnd, config=None):
         exposed = 0
     penalty = min(RISK_PENALTY_CAP, exposed * RISK_PENALTY_PER_ITEM)
 
-    final = max(0.0, min(100.0, curved - penalty))
+    legacy_final = max(0.0, min(100.0, curved - penalty))
+    # --- Stage 2 grade: three strands (reasoning / completion / reflection) -------
+    strands = grade_strands(team_id, rnd, commitment)
+    final = strands["total"] if strands["total"] is not None else legacy_final
     return {
+        "strands": strands,
+        "legacy_score": round(legacy_final, 1),
         # None for a component means "not available this round — not counted".
         "components": {k: (round(comps[k], 1) if k in comps else None)
                        for k in ROUND_SCORE_COMPONENTS},

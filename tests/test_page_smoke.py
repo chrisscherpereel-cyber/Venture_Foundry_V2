@@ -27,7 +27,8 @@ STUDENT_PAGES = ["Round Briefing", "Inbox", "Concept Check", "Decision Journal",
 DIRECTOR_PAGES = ["🏠 Start here", "Games", "Cohort Overview", "Auto-Director", "Team Setup",
                   "Schedule & Timing", "Round Control", "Resources", "Market Events",
                   "VP Auction", "Pivot Committee", "Dashboard Scoring", "Round Scores",
-                  "Evidence Review", "Misconception Radar", "Demo Day", "Backup & Restore"]
+                  "Evidence Review", "Gradebook", "Misconception Radar", "Demo Day",
+                  "Backup & Restore"]
 
 
 def _reset_storage():

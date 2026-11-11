@@ -6,6 +6,8 @@ sits at the top, and every input carries a hover-help (ⓘ) tooltip so a first-t
 user can run the simulation without an instruction manual.
 """
 
+import json
+
 import streamlit as st
 
 import db
@@ -1163,6 +1165,7 @@ def _finalized_scores(team):
     instructor adjustment and its reason)."""
     cur = db.current_round()
     if cur <= 1:
+        _score_explainer(team, cur)
         return
     with st.expander("🏁 Past round scores (frozen when each round closed)"):
         st.caption("Each round's score is saved when the round ends, so later work never "
@@ -1170,11 +1173,33 @@ def _finalized_scores(team):
         rows = []
         for r in range(1, cur):
             rs = logic.round_score(team["id"], r)
+            sd = rs.get("strands") or {}
             rows.append({"Round": r, "Score /100": rs["score"], "Grade": rs["grade"],
+                         "Reasoning": sd.get("reasoning"), "Completion": sd.get("completion"),
+                         "Reflection": sd.get("reflection"),
                          "Automated": rs.get("auto_score", rs["score"]),
                          "Adjustment": rs.get("adjustment", 0) or 0,
                          "Reason": rs.get("adjust_reason") or ""})
         st.dataframe(rows, use_container_width=True, hide_index=True)
+    _score_explainer(team, cur)
+
+
+def _score_explainer(team, cur):
+    """Why this round's score is what it is — each criterion's level and reasons."""
+    rs = logic.round_score(team["id"], cur)
+    sd = rs.get("strands") or {}
+    with st.expander(f"🧭 How Round {cur} is being scored (live estimate: {rs['score']:.0f}/100)"):
+        w = sd.get("weights") or content.GRADE_WEIGHTS
+        st.caption(f"Three strands: reasoning {w['reasoning']:g} · completion {w['completion']:g} "
+                   f"· reflection {w['reflection']:g}. These are estimates from your record; "
+                   "your instructor reviews and can adjust them. Contradicting your own "
+                   "assumption with a good test scores as well as confirming it.")
+        st.write(f"**Reasoning:** {sd.get('reasoning', 'n/a')} · **Completion:** "
+                 f"{sd.get('completion', 'n/a')} · **Reflection:** {sd.get('reflection', 'n/a')}")
+        for code, c in (sd.get("criteria") or {}).items():
+            st.markdown(f"- **{code} {c['name']}** — level {c['level']}/4: " + "; ".join(c["reasons"]))
+        for why in sd.get("reflection_reasons") or []:
+            st.caption("Reflection: " + why)
 
 
 def dashboard(team):
@@ -1488,15 +1513,37 @@ def _pitch_builder(team, gid):
     elif score["ready"]:
         st.success("✅ Your core pitch is complete — polish the wording and you're ready to present.")
 
+    rep_ = logic.pitch_citation_report(team["id"])
+    if rep_ and rep_["uncited"]:
+        names = [content.PITCH_CANVAS_BY_KEY[k][0] for k in rep_["uncited"]]
+        st.warning("🔗 **Unsupported claims:** " + ", ".join(names) + " — these blocks make "
+                   "claims but cite no evidence from your ledger. Cite the items that back "
+                   "them, or reword them as what you believe and are still testing.")
+    if rep_ and rep_["traction_filled"] and not rep_["traction_qualified"]:
+        st.warning("🔗 Your **Traction** block isn't backed by an *accepted* behavioral item "
+                   "(strength 6+). Don't present it as proven traction yet.")
+    ev_opts = {e["id"]: e for e in db.list_counted_evidence(team["id"])}
+    _fmt = lambda i: (f"#{i} [{ev_opts[i]['strength']}/10 · "  # noqa: E731
+                      f"{logic.evidence_review_label(ev_opts[i])}] {ev_opts[i]['description'][:60]}")
+    old_cites = saved.get("_cites") or {}
     locked = logic.editing_locked(team["id"])
     with st.form("pitch_canvas_form"):
         vals = {}
+        cites = {}
         for key, title, prompt, src in content.PITCH_CANVAS_BLOCKS:
             core = key in content.PITCH_CORE_BLOCKS
             lbl = f"{'⭐ ' if core else ''}{title}"
             vals[key] = st.text_area(lbl, value=saved.get(key, ""), key=f"pc_{key}",
                                      height=70, help=prompt + (f"  ·  Auto-fill source: {src}." if src else ""),
                                      disabled=locked)
+            if key in logic.PITCH_CLAIM_BLOCKS:
+                cites[key] = st.multiselect(
+                    f"Evidence behind “{title}”", list(ev_opts),
+                    default=[int(i) for i in (old_cites.get(key) or []) if int(i) in ev_opts],
+                    format_func=_fmt, key=f"pcc_{key}", disabled=locked,
+                    help="Cite the ledger items that back this claim. Uncited claims are marked "
+                         "as unsupported (to you and to your instructor).")
+        vals["_cites"] = cites
         if st.form_submit_button("💾 Save pitch", type="primary", disabled=locked):
             db.save_pitch(team["id"], gid,
                           vals.get("simple_statement", ""), vals.get("product", ""),
@@ -2234,6 +2281,13 @@ def assumptions(team):
             st.caption(f"Status **{a['status']}** — {src_txt}."
                        + (f" Note: {a['status_note']}" if a.get("status_note")
                           and src == "instructor" else ""))
+            try:
+                _hist = json.loads(a.get("status_history") or "[]")
+            except (ValueError, TypeError):
+                _hist = []
+            if _hist:
+                st.caption("Status history: " + " → ".join(
+                    f"{h.get('to')} ({str(h.get('at', ''))[:10]}, {h.get('by')})" for h in _hist[-5:]))
             linked = [e for e in db.list_evidence(team["id"])
                       if e.get("assumption_id") == a["id"]
                       and e.get("review_status") not in db.EVIDENCE_EXCLUDED_STATUSES]
@@ -2489,6 +2543,8 @@ def experiments(team):
                 st.caption(f"Outcome overridden: {e['override_reason']}")
             if e.get("evidence_id"):
                 st.caption(f"📒 Logged to your Evidence Ledger as item #{e['evidence_id']}.")
+            if e.get("simulated"):
+                st.caption("🧪 SIMULATED result (simulation pathway) — not real-world evidence.")
             if not editable or locked:
                 if locked:
                     st.caption("🔒 This result was recorded in an earlier round and is locked.")
@@ -2498,6 +2554,26 @@ def experiments(team):
                 if e.get("decision"):
                     st.write(f"**Decision:** {e['decision']}")
                 continue
+            # ---- Simulation pathway (instructor-enabled, per team) ----------------
+            if (logic.sim_enabled(team["id"]) and e.get("observed_value") is None
+                    and has_nums):
+                with st.container(border=True):
+                    st.markdown("🧪 **Simulated run** — your instructor enabled the simulation "
+                                "pathway for your team. A simulated run samples simulated "
+                                "customers and reports the **% who responded**, so your "
+                                "thresholds should be % values. The result is labelled "
+                                "SIMULATION and can't be re-rolled.")
+                    lo = logic.card_min_sample(e["card_type"])
+                    sim_n = st.number_input("Simulated sample size", min_value=lo,
+                                            max_value=content.SIM_MAX_SAMPLE, value=lo, step=1,
+                                            key=f"simn_{e['id']}")
+                    if st.button("Run simulated test", key=f"simrun_{e['id']}"):
+                        ok, msg = logic.simulate_experiment(team["id"], e["id"], int(sim_n))
+                        if ok:
+                            st.session_state["_exp_flash"] = msg
+                            st.rerun()
+                        else:
+                            st.error(msg)
             # ---- Learning Card (Strategyzer): believed → tested → observed → learned → decide
             st.markdown("**🃏 Learning Card** — capture the result as a decision, not just a note.")
             st.caption(f"We believed: *{e['hypothesis']}*  ·  We tested with: *{e['card_type']}*  "
@@ -2671,18 +2747,27 @@ def evidence(team):
             "Limitations (optional)", key="ev_lim",
             placeholder="Only one hall; collected during exam week.",
             help="Sample, bias, or relevance limits a skeptical reader would point out.")
-        strength = 0 if practice else content.EVIDENCE_LADDER_MAP.get(etype, 0)
+        dims = {}
+        reasons = []
         if practice:
+            strength = 0
             st.caption("🧪 **AI practice** — saved for rehearsal; strength 0, no credit, no "
                        "assumption link.")
         else:
+            st.markdown("**How strong is it?** Answer four quick questions (adapted from "
+                        "*Testing Business Ideas*). Your strength comes from these answers, "
+                        "capped by the evidence type you chose.")
+            dcols = st.columns(4)
+            for i, (key, q, opts, _lbl) in enumerate(content.STRENGTH_DIMENSIONS):
+                pick = dcols[i].radio(q, opts, key=f"ev_dim_{key}", index=0)
+                dims[key] = opts.index(pick) == 1
+            strength, reasons = logic.interpretive_strength(etype, dims, n_val or None, limitations)
             auto = strength <= content.EVIDENCE_AUTO_ACCEPT_MAX_STRENGTH
-            st.caption(f"Selected strength: **{strength}/10** → "
-                       f"{'behavioral (what they did)' if strength >= 6 else 'opinion/intention (what they said)' if strength <= 2 else 'mid-ladder'}"
-                       f" · pays **{content.EVIDENCE_BASE_CREDIT:g}** now"
-                       + (f" + **{logic.evidence_release(strength):g}** on auto-acceptance"
-                          if auto else f", **{logic.evidence_release(strength):g}** more after "
-                                       "instructor review"))
+            st.caption(f"Counted strength: **{strength}/10** — because "
+                       + "; ".join(reasons) + "."
+                       + f" Pays **{content.EVIDENCE_BASE_CREDIT:g}** credit now"
+                       + (", the rest on auto-acceptance." if auto
+                          else ", the rest after instructor review."))
 
         # Live misclassification nudge — compares your wording to the strength you chose.
         flags = [] if practice else (logic.evidence_flags(description, source, strength)
@@ -2691,7 +2776,7 @@ def evidence(team):
             st.warning("🔎 " + f + " *(Flagged items go to instructor review instead of "
                        "auto-acceptance. This check is a wording heuristic — it can be wrong.)*")
 
-        assum_id, direction = None, None
+        assum_id, direction, interpretation = None, None, ""
         if assums and not practice:
             assum_id = st.selectbox(
                 "Related assumption (optional)",
@@ -2705,6 +2790,12 @@ def evidence(team):
                     help="Supports = makes it more likely true. Contradicts = makes it less "
                          "likely. Inconclusive = doesn't settle it either way. Contradicting "
                          "evidence earns the same credit as supporting evidence.")
+                interpretation = st.text_input(
+                    "Interpretation — what does this mean for the assumption?", key="ev_interp",
+                    placeholder="Owners already track waste weekly, so the pain is real but "
+                                "they may not pay for a separate tool.",
+                    help="Required when linked. Keep it separate from the observation above: "
+                         "the observation is what happened; this is what you think it means.")
 
         can_log = bool(description.strip()) and bool(justification.strip())
         if not can_log:
@@ -2715,9 +2806,10 @@ def evidence(team):
                 team["id"], description, etype, source, justification,
                 assumption_id=assum_id, direction=direction, origin=origin,
                 collected_on=collected.isoformat() if collected else None,
-                sample_n=int(n_val) if n_val else None, limitations=limitations)
+                sample_n=int(n_val) if n_val else None, limitations=limitations,
+                interpretation=interpretation, dims=None if practice else dims)
             if res["ok"]:
-                for k in ("ev_desc", "ev_src", "ev_just", "ev_lim", "ev_n", "ev_dir"):
+                for k in ("ev_desc", "ev_src", "ev_just", "ev_lim", "ev_n", "ev_dir", "ev_interp"):
                     st.session_state.pop(k, None)
                 st.session_state["_ev_flash"] = (
                     "warning" if res["pending"] or res["flags"] else "success", res["message"])
@@ -2769,10 +2861,23 @@ def evidence(team):
                 if e.get("assumption_id"):
                     at = next((a["text"] for a in assums if a["id"] == e["assumption_id"]), "")
                     st.write(f"**Assumption:** {at} — *{e.get('direction') or 'direction not stated'}*")
+                if e.get("interpretation"):
+                    st.write(f"**Interpretation:** {e['interpretation']}")
                 if e.get("justification"):
                     st.write(f"**Why this strength:** {e['justification']}")
+                if e.get("strength_reasons"):
+                    try:
+                        _rs = json.loads(e["strength_reasons"])
+                    except (ValueError, TypeError):
+                        _rs = []
+                    if _rs:
+                        st.caption("Counted as " + str(e["strength"]) + "/10 because " + "; ".join(_rs) + ".")
                 if e.get("limitations"):
                     st.write(f"**Limitations:** {e['limitations']}")
+                if (e.get("origin") or "") == "Simulation":
+                    st.caption("🧪 SIMULATION — a simulated result (instructor-enabled pathway). "
+                               "It counts toward your assumptions and venture value, not as "
+                               "real-world customer evidence.")
                 if e.get("review_note"):
                     st.info(f"Instructor note: {e['review_note']}")
                 for f in efl:
@@ -3189,6 +3294,23 @@ def reflections(team):
             focus_answer = st.text_area(f"🎯 {focus_q}", value=ex.get("focus_answer", ""),
                                         key=f"jr_focus_{cur}",
                                         help="This prompt changes with the round's topic.")
+            _assums = db.list_assumptions(team["id"])
+            j_aid = None
+            changed = ""
+            if _assums:
+                _ids = [None] + [a["id"] for a in _assums]
+                j_aid = st.selectbox(
+                    "Which assumption is this reflection about?", _ids,
+                    index=_ids.index(ex.get("assumption_id")) if ex.get("assumption_id") in _ids else 0,
+                    format_func=lambda i: "— (none)" if i is None else
+                    next(a["text"] for a in _assums if a["id"] == i)[:90],
+                    key=f"jr_aid_{cur}",
+                    help="Tie your reflection to one assumption. Entries tied to an assumption "
+                         "count fully toward your reflection grade.")
+                changed = st.text_input(
+                    "Did evidence change your mind about it this round? How?",
+                    value=ex.get("changed_mind") or "", key=f"jr_changed_{cur}",
+                    placeholder="Yes — after 2 of 52 deposits I no longer think students plan a week ahead.")
             persp_note = ""
             if persp:
                 persp_note = st.text_area(
@@ -3216,6 +3338,7 @@ def reflections(team):
                         "focus_prompt": focus_q, "focus_answer": focus_answer,
                         "perspective": persp["name"] if persp else "",
                         "perspective_note": persp_note,
+                        "assumption_id": j_aid, "changed_mind": changed,
                     })
                     st.success("Saved. Come back to edit it anytime before the round advances.")
                     st.rerun()
