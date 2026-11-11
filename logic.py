@@ -1024,25 +1024,25 @@ def on_round_change(new_round):
             marker = 1
     if new_round <= marker:
         return
-    rounds_passed = new_round - marker
+    # Each (team, closed round) is processed once even if an advance is retried after
+    # a crash part-way through: finalize and snapshots are upserts/first-write-wins,
+    # the salary is charged through apply_once_tx (tagged with the round), and the
+    # learning step is guarded by a per-team, per-round flag set right after it.
     for t in db.list_teams():   # active game's teams (or all, if no game context)
-        # Freeze each finished round's score FIRST, from the work as it stands at the
-        # moment the round closes (idempotent: an existing frozen row is never replaced).
         for r in range(marker, new_round):
+            # Freeze the round's score FIRST, from the work as it stands at close.
             finalize_round_result(t["id"], r, source="advance")
-        # snapshot each finished round's learning metrics BEFORE applying new learning,
-        # so the team can see its progress trend over time.
-        for r in range(marker, new_round):
+            # Snapshot learning metrics BEFORE applying new learning (trend charts).
             snapshot_metrics(t["id"], r)
-        # learning from each round that just finished
-        for r in range(marker, new_round):
-            _apply_round_learning(t["id"], r)
+            salary = sum((h["per_round"] or 0) for h in db.list_hires(t["id"]))
+            if salary:
+                db.apply_once_tx(t["id"], "salary", f"salary g{gid} r{r}", money=-salary,
+                                 description=f"Specialist salaries (round {r})")
+            flag = f"round_learning:{gid}:{t['id']}:{r}"
+            if db.get_setting(flag) != "1":
+                _apply_round_learning(t["id"], r)
+                db.set_setting(flag, "1")
         # (available hours reset lazily via sync_round_hours when a team next loads)
-        # charge salaries for each round passed
-        salary = sum((h["per_round"] or 0) for h in db.list_hires(t["id"]))
-        if salary:
-            db.adjust_resources(t["id"], money=-salary * rounds_passed, kind="salary",
-                                description="Specialist salaries", allow_negative=True)
     if gid:
         db.set_game_marker(gid, new_round)
     else:
@@ -1406,6 +1406,16 @@ _BEHAVIOR_CUES = [
 ]
 
 
+_CONDITIONAL_CUES = [
+    "would have", "would've", "'d have", "if it existed", "if we had", "if there was",
+    "if there were", "if we built", "if you built", "hypothetically", "would pay",
+    "would buy", "would sign", "said they would", "said they'd",
+]
+_AI_CUES = ["chatgpt", "gpt-", "gpt4", "gpt 4", "ai persona", "persona", "ai-generated",
+            "ai generated", "generated interview", "simulated interview", "synthetic",
+            "gemini", "copilot", "claude.ai", "llm"]
+
+
 def _has_cue(text, cues):
     t = (text or "").lower()
     return any(c in t for c in cues)
@@ -1433,6 +1443,18 @@ def evidence_flags(description, source, strength):
         flags.append(
             "This describes a real action, which is usually **stronger** than a strength-"
             f"{strength} opinion — you may be under-crediting it. Re-check the ladder.")
+    # Conditional / hypothetical wording even when action words appear
+    # ("she would have paid", "he'd have signed if…") — an intention, not an action.
+    if strength >= 4 and not flags and _has_cue(text, _CONDITIONAL_CUES):
+        flags.append(
+            "This uses conditional or hypothetical wording (\"would have\", \"if it "
+            "existed\") — that describes an intention, even if it mentions paying or "
+            f"signing. Strength {strength} needs something the customer actually did.")
+    # AI personas / generated interviews presented as real research.
+    if _has_cue(text, _AI_CUES):
+        flags.append(
+            "This mentions an AI tool or persona. AI-generated interviews and personas are "
+            "practice material, not customer evidence — log them as **AI practice**.")
     # High strength claimed with no concrete action words at all.
     if strength >= 8 and not behavior:
         flags.append(
@@ -1984,9 +2006,17 @@ def compute_valuation(team_id):
 # --------------------------------------------------------------------------- #
 # Evidence-portfolio analytics
 # --------------------------------------------------------------------------- #
+def scored_evidence(team_id):
+    """Evidence whose STRENGTH may influence scores, valuation and badges: counted
+    evidence that isn't still waiting for review. A self-rated strong claim affects
+    nothing until the instructor accepts it (it still counts toward 'log N items')."""
+    return [e for e in db.list_counted_evidence(team_id)
+            if e.get("review_status") not in ("Pending review", "Needs artifact")]
+
+
 def evidence_summary(team_id):
-    # Only counted evidence: real-world, not withdrawn/duplicate/practice.
-    ev = db.list_counted_evidence(team_id)
+    # Only scored evidence: real-world, not withdrawn/duplicate/practice, not pending.
+    ev = scored_evidence(team_id)
     total_strength = sum(e["strength"] for e in ev)
     total_credits = sum(e["credits_award"] for e in ev)
     behavioral = sum(1 for e in ev if e["strength"] >= 6)
@@ -2033,10 +2063,14 @@ def log_mini_pivot(team_id, original, evidence, change, pivot_type=""):
                  {"original_assum": original, "challenge_evid": evidence,
                   "proposed_change": change, "pivot_type": pivot_type},
                  kind="mini", status="Logged", round_no=rnd)
-    db.adjust_resources(team_id, credits=MINI_PIVOT_CREDIT, kind="learning",
-                        description="Mini-pivot logged — learning from evidence",
-                        allow_negative=True)
-    return MINI_PIVOT_CREDIT
+    # The learning reward needs the evidence that changed your mind, and is paid at
+    # most once per round (so repeated or double-clicked logs don't farm credits).
+    if not (evidence or "").strip():
+        return 0
+    paid = db.apply_once_tx(team_id, "learning", f"mini-pivot r{rnd}",
+                            credits=MINI_PIVOT_CREDIT,
+                            description="Mini-pivot logged — learning from evidence")
+    return MINI_PIVOT_CREDIT if paid else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -2063,11 +2097,14 @@ def affordable_loss_status(team):
 def log_partner_commitment(team_id, name, commitment, evidence):
     """Record a self-selected partner who has pre-committed (crazy quilt) and reward
     the learning. Returns the Evidence-Credit reward."""
-    db.add_partner(team_id, name, commitment, evidence, round_no=db.current_round())
-    db.adjust_resources(team_id, credits=PARTNER_CREDIT, kind="learning",
-                        description=f"Partner pre-commitment secured: {name}",
-                        allow_negative=True)
-    return PARTNER_CREDIT
+    rnd = db.current_round()
+    db.add_partner(team_id, name, commitment, evidence, round_no=rnd)
+    # Reward at most once per round, and only with something checkable as evidence.
+    if not (evidence or "").strip():
+        return 0
+    paid = db.apply_once_tx(team_id, "learning", f"partner r{rnd}", credits=PARTNER_CREDIT,
+                            description=f"Partner pre-commitment secured: {name}")
+    return PARTNER_CREDIT if paid else 0
 
 
 def exploit_event(team_id, event_id, text):
@@ -2411,9 +2448,9 @@ def founder_level(team_id):
 def team_badges(team_id):
     """Set of badge codes the team has EARNED, computed from current state."""
     codes = set()
-    ev = db.list_counted_evidence(team_id)
+    ev = scored_evidence(team_id)
     es = evidence_summary(team_id)
-    if ev:
+    if db.list_counted_evidence(team_id):
         codes.add("first_evidence")
     # A paying-customer badge needs an ACCEPTED (or legacy) top-of-ladder item —
     # a self-rated claim still awaiting review doesn't earn it.
@@ -2539,7 +2576,7 @@ def set_demo_open(game_id, on):
 
 
 def strongest_evidence(team_id):
-    ev = db.list_counted_evidence(team_id)
+    ev = scored_evidence(team_id)
     return max(ev, key=lambda e: e["strength"]) if ev else None
 
 
@@ -3813,8 +3850,29 @@ def suggest_event(team_id, round_no=None):
     return {"category": category, "text": text, "exposes": exposes, "reason": reason}
 
 
+def _has_disconfirming_record(team_id):
+    """A refuted assumption, or accepted evidence that contradicts an assumption."""
+    if not team_id:
+        return False
+    if any(a["status"] == "Refuted" for a in db.list_assumptions(team_id)):
+        return True
+    return any(e.get("direction") == "Contradicts" and
+               (e.get("review_status") is None or evidence_is_qualified(e))
+               for e in db.list_counted_evidence(team_id))
+
+
 def recommend_pivot(pivot):
-    """Recommend a committee decision for a pivot petition from its completeness."""
+    """Recommend a committee decision for a pivot petition. Beyond completeness, an
+    approval requires disconfirming evidence ON RECORD (a refuted assumption or
+    accepted contradicting evidence) — text in the petition alone isn't enough."""
+    tid = pivot.get("team_id")
+    if tid and (pivot.get("challenge_evid") or "").strip() \
+            and (pivot.get("proposed_change") or "").strip() \
+            and (pivot.get("original_assum") or "").strip() \
+            and not _has_disconfirming_record(tid):
+        return "NeedsEvidence", ("The petition cites evidence, but the team's ledger has no "
+                                 "refuted assumption or accepted contradicting evidence yet — "
+                                 "log it (or run the test) first.")
     has_evidence = bool((pivot.get("challenge_evid") or "").strip())
     has_change = bool((pivot.get("proposed_change") or "").strip())
     has_new = bool((pivot.get("new_assumptions") or "").strip())

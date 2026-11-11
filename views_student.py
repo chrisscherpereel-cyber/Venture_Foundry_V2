@@ -423,7 +423,8 @@ def _mini_pivot_section(team):
                      f"{len(existing)} so far"):
         st.caption("Good founders change direction when the evidence says so — the earlier and "
                    "cheaper, the better. A mini-pivot is a quick, self-approved note (no committee "
-                   f"needed) and earns +{logic.MINI_PIVOT_CREDIT} Evidence Credits for the learning. "
+                   f"needed). Naming the evidence that changed your mind earns +{logic.MINI_PIVOT_CREDIT} "
+                   "Evidence Credits (once per round). "
                    "The formal Pivot Petition (investment committee) unlocks later for bigger changes.")
         if logic.editing_locked(team["id"]):
             _committed_banner(team)
@@ -450,8 +451,9 @@ def _mini_pivot_section(team):
                         st.error("Tell us what was wrong and what you'll change.")
                     else:
                         reward = logic.log_mini_pivot(team["id"], original, evidence, change, mptype)
-                        st.success(f"Course correction logged. +{reward} Evidence Credits for "
-                                   "learning from evidence.")
+                        st.toast(f"Course correction logged. +{reward} Evidence Credits."
+                                 if reward else "Course correction logged. (Credit is paid once "
+                                 "per round, and only when you name the evidence.)")
                         st.rerun()
         for p in existing:
             st.markdown(f"- **R{p.get('round','?')}:** {p['original_assum']} → "
@@ -1454,6 +1456,14 @@ def _pitch_builder(team, gid):
                "short). The ✨ button drafts blocks from your real work — Customer Profile, VPC, "
                "Business Model Canvas, Evidence Ledger, and your valuation — so your pitch stands "
                "on evidence, not adjectives.")
+    st.caption("The Pitch Canvas© is by David Beckett / Best3Minutes "
+               "([best3minutes.com](https://best3minutes.com)), licensed CC BY-SA 4.0; the "
+               "prompts here are adapted from it.")
+    _behav = [e for e in logic.scored_evidence(team["id"]) if (e["strength"] or 0) >= 6]
+    if not _behav:
+        st.warning("⚠️ Your Evidence Ledger has no **accepted behavioral evidence** (strength 6+) "
+                   "yet. Keep traction claims honest: say what you've observed and what you're "
+                   "still testing (\"we believe…\"), not what you hope is true.")
     saved = db.get_pitch_canvas(team["id"])
     p = db.get_pitch(team["id"]) or {}
     # one-click autofill of empty blocks
@@ -1643,8 +1653,10 @@ def _effectuation_panel(team, editable):
 
     st.markdown("**🧩 Partners & pre-commitments (crazy quilt)**")
     st.caption(f"Log a self-selected partner or customer who has actually pre-committed — a "
-               f"stocking agreement, an intro, a letter of intent. Each earns "
-               f"+{logic.PARTNER_CREDIT} Evidence Credits; real commitments are strong signals.")
+               f"stocking agreement, an intro, a letter of intent. A commitment with evidence "
+               f"(an email, a signature, an intro made) earns +{logic.PARTNER_CREDIT} Evidence "
+               f"Credits, once per round. Most letters of intent are not binding — record what "
+               f"was actually committed.")
     if editable and not logic.editing_locked(team["id"]):
         with st.form("partner_form", clear_on_submit=True):
             pc = st.columns([2, 3, 3])
@@ -1654,7 +1666,8 @@ def _effectuation_panel(team, editable):
             if st.form_submit_button("➕ Log pre-commitment"):
                 if name.strip() and commit.strip():
                     r = logic.log_partner_commitment(team["id"], name, commit, evid)
-                    st.success(f"Logged. +{r} Evidence Credits for a real commitment.")
+                    st.toast(f"Logged. +{r} Evidence Credits." if r else
+                             "Logged. (Credit is paid once per round, and only with evidence.)")
                     st.rerun()
                 else:
                     st.error("Add at least the partner and what they committed to.")
@@ -2723,8 +2736,9 @@ def evidence(team):
                   and logic.evidence_flags(e["description"], e["source"], e["strength"]))
     pending = sum(1 for e in ev if e.get("review_status") in ("Pending review", "Needs artifact"))
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Items", esum["count"], help="Counted evidence (real-world, not withdrawn, "
-                                            "not duplicates, not AI practice).")
+    c1.metric("Items", esum["count"], help="Evidence that counts toward scores: real-world, "
+                                            "not withdrawn, not duplicates, not AI practice, and "
+                                            "not still waiting for review.")
     c2.metric("Avg strength", esum["avg_strength"],
               help="Average strength of your counted evidence.")
     c3.metric("Behavioral", esum["behavioral"], help="Evidence of strength 6+ (what people did).")

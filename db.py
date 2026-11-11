@@ -1036,16 +1036,27 @@ def next_version(team_id, ctype):
 
 
 def save_canvas(team_id, ctype, data, label="", note=""):
-    v = next_version(team_id, ctype)
+    """Save a new canvas version. The version number is read and written inside one
+    locked transaction, so two teammates saving at the same moment get v(n) and
+    v(n+1) instead of two copies of the same version."""
+    rnd = current_round()
     conn = get_conn()
     try:
+        _begin_team_lock(conn, team_id)
+        row = conn.execute(
+            "SELECT MAX(version) AS m FROM canvases WHERE team_id=? AND ctype=?",
+            (team_id, ctype)).fetchone()
+        v = (row["m"] or 0) + 1
         conn.execute(
             """INSERT INTO canvases(team_id, ctype, version, label, data, note, round, created_at)
                VALUES(?,?,?,?,?,?,?,?)""",
-            (team_id, ctype, v, label, _dumps(data), note, current_round(), now()),
+            (team_id, ctype, v, label, _dumps(data), note, rnd, now()),
         )
         conn.commit()
         return v
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -1522,6 +1533,33 @@ def record_experiment_result_tx(team_id, exp_id, exp_updates, evidence_fields, a
                      (*updates.values(), exp_id, team_id))
         conn.commit()
         return True, "Saved.", ev_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def apply_once_tx(team_id, kind, tag, money=0, credits=0, description=""):
+    """Apply a resource change at most once per (team, kind, tag) — e.g. one salary
+    charge per round, or one learning reward per round. The existence check and the
+    change happen in one locked transaction, so a double-click, a retried advance,
+    or two sessions at once can't apply it twice. Returns True if applied now."""
+    conn = get_conn()
+    try:
+        team = _begin_team_lock(conn, team_id)
+        if not team:
+            conn.rollback()
+            return False
+        marker = f"[{tag}]"
+        if conn.execute("SELECT id FROM transactions WHERE team_id=? AND kind=? AND description LIKE ?",
+                        (team_id, kind, f"%{marker}%")).fetchone():
+            conn.rollback()
+            return False
+        _apply_resources(conn, team, money=money, credits=credits, kind=kind,
+                         description=f"{description} {marker}".strip(), allow_negative=True)
+        conn.commit()
+        return True
     except Exception:
         conn.rollback()
         raise

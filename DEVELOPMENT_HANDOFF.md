@@ -1,6 +1,6 @@
 # Venture Foundry — Development Handoff
 
-_Last updated: 2026-11-11 · Stage 1 merged into `main` (fast-forward to `5c4a9df`) on 2026-11-11; work branch `dev/stage1-trustworthy-record`. If Streamlit Community Cloud deploys from `main`, the live app picks this up on its next rebuild._
+_Last updated: 2026-11-11 · Stage 1 merged into `main` (`5c4a9df`, handoff note `e362e7e`). **Pilot-readiness review fixes are on `dev/stage1-trustworthy-record` only — NOT merged to `main`.** Review report: Claude Doc "Venture Foundry V2 — Pilot Readiness Review"._
 
 Planning documents (Claude Docs, in the "New Venture Foundry" project):
 - *Venture Foundry V2 — Audit and Development Plan* (audit, backlog B1–B20)
@@ -46,9 +46,16 @@ pip install -r requirements.txt pytest
 pytest -q tests/                                   # SQLite (default)
 DATABASE_URL="postgresql://user@host:port/db" pytest -q tests/   # same suite on Postgres
 ```
-**Results on this branch (2026-11-11, Python 3.13, Streamlit 1.67.0):**
-- **SQLite:** 84 passed.
-- **Local Postgres 16:** 82 passed, 2 skipped. Both skips are SQLite-only: WAL mode and the legacy-schema builder.
+**Results on this branch (2026-11-11, Python 3.13, Streamlit 1.67.0), after the review fixes:**
+- **SQLite:** 96 passed.
+- **Local Postgres 16:** 94 passed, 2 skipped (the two SQLite-only tests).
+
+**Load (`tools/load_test.py`, 2 vCPU sandbox, 35 users + 1 director, in-process AppTest):**
+- **Writes:** p50 0.19 s / p95 1.31 s on SQLite; p50 0.12 s / p95 0.73 s on local Postgres.
+- **Renders:** p50 13–20 s, harness-bound. The same read burst takes about the same on the pre-Stage-1 commit.
+- **Integrity:** no lost updates, duplicate versions or negative balances; ledgers reconcile.
+- **Errors:** only AppTest thread artifacts, which also occur on the old commit.
+- **Not measured:** a real browser or Streamlit server, or Neon.
 
 **Test files:**
 - `tests/test_learning_integrity.py` (30): the evidence, review, experiment, status, frozen-score and deadline rules, including concurrency and retry cases.
@@ -70,6 +77,19 @@ DATABASE_URL="postgresql://user@host:port/db" pytest -q tests/   # same suite on
     - Behaviour after rollback: items logged under Stage 1 keep the credits they actually received. Old code would count "Withdrawn", "Duplicate" and "Practice" items as ordinary evidence.
     - For a clean rollback, restore the pre-deploy backup. That discards everything since deploy.
 5. Never reset the database to apply this schema. `init_db` is idempotent, and `tests/test_migration_legacy.py` runs it twice.
+
+## Pilot-readiness review (2026-11-11) — fixes on the dev branch, not yet on `main`
+| Fix | Defect it closes | Where |
+|---|---|---|
+| Pending/needs-artifact items don't count toward scores, valuation, badges or the pitch's strongest evidence | A self-rated "binding payment" moved the round score's evidence component to 84 before any review | `logic.scored_evidence`, `evidence_summary`, `strongest_evidence`, `team_badges` |
+| Retried/double advance is idempotent per team and round | A crash part-way through an advance, then a retry, charged one team's salary twice | `logic.on_round_change`, `db.apply_once_tx` |
+| Atomic canvas versioning | 8 concurrent saves produced versions 1,1,1,2,2,… | `db.save_canvas` |
+| Mini-pivot and partner rewards need evidence and pay at most once per round | Unlimited +3/+4 credits; double-clicks paid twice | `logic.log_mini_pivot`, `logic.log_partner_commitment` |
+| Pivot autopilot requires disconfirming evidence on record | "we feel like it" was auto-Approved | `logic.recommend_pivot` |
+| Wording flags catch conditional language and AI persona/tool mentions (routes to review) | "would have paid" logged as binding: no flag; "ChatGPT persona" logged as real: auto-accepted | `logic.evidence_flags` |
+| Pitch Canvas CC BY-SA credit and a no-accepted-traction warning on the Pitch Builder | Required notice existed only in a code comment | `views_student._pitch_builder` |
+
+Tests added: `tests/test_review_fixes.py` (12). Load-test tool: `tools/load_test.py`.
 
 ## Known limitations / unresolved
 - **Experiment-result writes:** evidence and credit are atomic in one transaction. The follow-on assumption-status refresh is a separate write; it is idempotent and is recomputed on the next evidence or result event if it is ever interrupted.
@@ -104,4 +124,6 @@ DATABASE_URL="postgresql://user@host:port/db" pytest -q tests/   # same suite on
 - **Deferred:** simulated market, AI personas beyond scripted, file uploads, individual logins.
 
 ## Next recommended task
+0. **First:** merge the review fixes on `dev/stage1-trustworthy-record` into `main` (after a backup), then run the instructor pilot checklist in the review report.
+
 Stage 2, starting with **L22 / B8 per-game settings**. Schedule, grading and automation settings are global today, so two sections can't run different deadlines or weights. Then **L5 interpretive strength**, which replaces the category-only strength that Stage 1 still uses for new items.
