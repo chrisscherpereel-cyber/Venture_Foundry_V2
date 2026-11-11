@@ -1,0 +1,6 @@
+<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Venture Foundry logo — Molten V">
+  <path d="M34 42 L60 88 L86 42" fill="none" stroke="#f2a938" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M28 36 h16 M28 36 v16" fill="none" stroke="#24324d" stroke-width="6" stroke-linecap="round"/>
+  <path d="M92 36 h-16 M92 36 v16" fill="none" stroke="#24324d" stroke-width="6" stroke-linecap="round"/>
+  <path d="M60 20 L62 27 L69 29 L62 31 L60 38 L58 31 L51 29 L58 27 Z" fill="#f2a938"/>
+</svg>

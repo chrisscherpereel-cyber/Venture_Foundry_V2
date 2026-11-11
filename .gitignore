@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# Local game data — never commit student data
+*.db
+*.db-wal
+*.db-shm
+.streamlit/secrets.toml
+.env
+.env.*

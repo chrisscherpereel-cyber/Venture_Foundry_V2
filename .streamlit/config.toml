@@ -1,0 +1,9 @@
+[server]
+# The only upload is the class roster (.xlsx/.csv, typically a few KB). Capping
+# uploads at 10 MB (default 200 MB) stops an accidental large file from being
+# held fully in the shared server's limited memory.
+maxUploadSize = 10
+
+[browser]
+# Don't send usage telemetry from every student's browser.
+gatherUsageStats = false

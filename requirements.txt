@@ -1,0 +1,8 @@
+# Pinned to the versions this app was tested with, so a Streamlit Community Cloud
+# rebuild can't silently install a breaking release mid-semester. Bump deliberately.
+streamlit==1.67.0
+altair>=5.0,<7
+pandas>=2.0,<4
+openpyxl>=3.1,<4
+# Postgres (Neon) backend — used only when DATABASE_URL is set.
+psycopg[binary,pool]>=3.2,<4
