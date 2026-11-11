@@ -1,6 +1,6 @@
 # Venture Foundry — Development Handoff
 
-_Last updated: 2026-11-11 · Stage 1 merged into `main` (`5c4a9df`, handoff note `e362e7e`). **Pilot-readiness review fixes are on `dev/stage1-trustworthy-record` only — NOT merged to `main`.** Review report: Claude Doc "Venture Foundry V2 — Pilot Readiness Review"._
+_Last updated: 2026-11-11 · Stage 1 merged into `main` (`5c4a9df`, handoff note `e362e7e`). Pilot-readiness review fixes (`87bd2b9`) merged into `main` on 2026-11-11. Review report: Claude Doc "Venture Foundry V2 — Pilot Readiness Review"._
 
 Planning documents (Claude Docs, in the "New Venture Foundry" project):
 - *Venture Foundry V2 — Audit and Development Plan* (audit, backlog B1–B20)
@@ -78,7 +78,7 @@ DATABASE_URL="postgresql://user@host:port/db" pytest -q tests/   # same suite on
     - For a clean rollback, restore the pre-deploy backup. That discards everything since deploy.
 5. Never reset the database to apply this schema. `init_db` is idempotent, and `tests/test_migration_legacy.py` runs it twice.
 
-## Pilot-readiness review (2026-11-11) — fixes on the dev branch, not yet on `main`
+## Pilot-readiness review (2026-11-11) — fixes merged to `main`
 | Fix | Defect it closes | Where |
 |---|---|---|
 | Pending/needs-artifact items don't count toward scores, valuation, badges or the pitch's strongest evidence | A self-rated "binding payment" moved the round score's evidence component to 84 before any review | `logic.scored_evidence`, `evidence_summary`, `strongest_evidence`, `team_badges` |
@@ -124,6 +124,6 @@ Tests added: `tests/test_review_fixes.py` (12). Load-test tool: `tools/load_test
 - **Deferred:** simulated market, AI personas beyond scripted, file uploads, individual logins.
 
 ## Next recommended task
-0. **First:** merge the review fixes on `dev/stage1-trustworthy-record` into `main` (after a backup), then run the instructor pilot checklist in the review report.
+0. **First:** run the instructor pilot checklist in the review report (backup, freeze ended rounds, one section per deployment or manual advance).
 
 Stage 2, starting with **L22 / B8 per-game settings**. Schedule, grading and automation settings are global today, so two sections can't run different deadlines or weights. Then **L5 interpretive strength**, which replaces the category-only strength that Stage 1 still uses for new items.
