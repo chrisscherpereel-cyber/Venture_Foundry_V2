@@ -271,8 +271,29 @@ def _setup_wizard(gid):
             "control center with the round status, checklist, and one-click Advance.")
 
 
+def storage_banner():
+    """Loud, always-visible warning when the app isn't on durable Neon Postgres."""
+    s = db.storage_status()
+    if s["neon"]:
+        if not s["pooled"] or not s["sslmode_require"]:
+            st.warning("Storage is Neon Postgres, but the connection string should use Neon's "
+                       "**pooled** host (contains `-pooler`) with `sslmode=require`.")
+        return
+    if s["postgres"]:
+        st.warning(f"Storage is Postgres, but not on Neon (host `{s['host']}`). If that's "
+                   "intended, ignore this.")
+        return
+    st.error("⚠️ **Storage is a local SQLite file, not Postgres (Neon).** On Streamlit Community "
+             "Cloud this file is erased when the app reboots, sleeps or is updated — student work "
+             "can be lost. Fix: Streamlit Cloud → your app → **Settings → Secrets** → add a "
+             "root-level line `DATABASE_URL = \"postgresql://…\"` with your Neon **pooled** "
+             "connection string (`sslmode=require`), save, and reboot the app. To keep existing "
+             "data, download a backup first (Backup & Restore) and restore it after the switch.")
+
+
 def director_home():
     st.subheader("🏠 Start here")
+    storage_banner()
     gid = db.active_game_id()
     teams = db.list_teams()
     if not teams:

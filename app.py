@@ -515,6 +515,8 @@ def instructor_shell():
         diff = db.get_setting("difficulty", "not set")
         st.caption("Schedule, grading and automation settings apply to this game (section) "
                    "only.")
+        _ss = db.storage_status()
+        st.caption(("🟢 " if _ss["neon"] else "🔴 ") + f"Storage: **{_ss['backend']}**")
         st.caption(f"Round {db.current_round()} of {logic.total_rounds()} · "
                    f"{len(db.list_teams())} team(s) · Difficulty: {diff}")
         st.divider()

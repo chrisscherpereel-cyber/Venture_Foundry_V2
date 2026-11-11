@@ -318,3 +318,13 @@ def test_mp_resume_skips_teams_with_a_note():
     tid = _team()
     db.add_message(tid, "s", "b", 3, sender=f"{content.INVESTOR['name']} · x")
     assert logic._has_mp_note(tid, 3) and not logic._has_mp_note(tid, 4)
+
+
+def test_storage_status_detects_neon_without_leaking_secrets(monkeypatch):
+    url = ("postgresql://user:s3cret@ep-cool-name-123456-pooler.us-west-2.aws.neon.tech/"
+           "neondb?sslmode=require")
+    monkeypatch.setattr(db, "DATABASE_URL", url)
+    monkeypatch.setattr(db, "IS_PG", True)
+    s = db.storage_status()
+    assert s["neon"] and s["pooled"] and s["sslmode_require"]
+    assert "s3cret" not in str(s) and "user" not in s["host"]

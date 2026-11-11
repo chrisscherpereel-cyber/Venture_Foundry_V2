@@ -126,6 +126,21 @@ DATABASE_URL = _database_url()
 IS_PG = bool(DATABASE_URL)
 
 
+def storage_status():
+    """What the app is storing data in, and whether it is the durable Neon database.
+    Never includes the connection string or any credential."""
+    url = DATABASE_URL or ""
+    host = ""
+    if IS_PG:
+        m = re.search(r"@([^/:?]+)", url)
+        host = m.group(1) if m else ""
+    on_cloud = os.path.abspath(__file__).startswith("/mount/src/")   # Community Cloud
+    return {"backend": backend_name(), "postgres": IS_PG, "neon": "neon.tech" in host,
+            "pooled": "-pooler" in host, "sslmode_require": "sslmode=require" in url,
+            "host": host.split(".")[0] + ("…neon.tech" if "neon.tech" in host else "") if host else "",
+            "on_community_cloud": on_cloud}
+
+
 def backend_name():
     if not IS_PG:
         return "SQLite (local file)"
