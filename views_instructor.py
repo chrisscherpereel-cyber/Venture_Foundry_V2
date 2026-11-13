@@ -1136,14 +1136,63 @@ def demo_day_admin():
 # Team setup
 # --------------------------------------------------------------------------- #
 
-@st.cache_data(show_spinner=False)
 def _roster_template_bytes():
-    """The example roster workbook never changes — build it once per process instead
-    of re-generating it with openpyxl on every rerun of Team Setup."""
-    import io
-    tb = io.BytesIO()
-    logic.roster_template_workbook().save(tb)
-    return tb.getvalue()
+    """The roster template is stored IN the database (table stored_files), so it is the
+    same file for every login and survives restarts and redeploys."""
+    data, _info = db.get_stored_file(db.ROSTER_TEMPLATE_NAME)
+    return data
+
+
+def _members_editor():
+    """Add, move and remove team members for the ACTIVE game in one table."""
+    gid = db.active_game_id()
+    teams = db.list_teams(gid)
+    st.write("### 👥 Team members")
+    if not teams:
+        st.caption("Create or import teams first — then manage their members here.")
+        return
+    st.caption("Edit the table, then click **Save member changes**. **Add** a member with the "
+               "empty row at the bottom (choose a team). **Move** a member by changing their "
+               "Team. **Remove** a member by selecting the row (left edge) and pressing Delete, or "
+               "the 🗑️ icon. Only this game's teams are listed. A member's past journal entries "
+               "stay with the team they wrote them in.")
+    names = [t["name"] for t in teams]
+    if len(set(names)) != len(names):
+        st.warning("Two teams in this game share a name — rename one (expand it below) before "
+                   "moving members between them.")
+    members = logic.game_members(gid)
+    counts = {n: 0 for n in names}
+    for m in members:
+        counts[m["team"]] = counts.get(m["team"], 0) + 1
+    st.caption(" · ".join(f"**{n}**: {c}" for n, c in counts.items()))
+    import pandas as pd
+    df = pd.DataFrame([{"Name": m["name"], "Email": m["email"], "Team": m["team"]}
+                       for m in members] or [], columns=["Name", "Email", "Team"])
+    # The editor's key changes after each save, so it reloads from the database.
+    ver = st.session_state.get("_members_ver", 0)
+    edited = st.data_editor(
+        df, num_rows="dynamic", hide_index=True, width="stretch",
+        key=f"members_editor_{gid}_{ver}",
+        column_config={
+            "Name": st.column_config.TextColumn("Name", required=True),
+            "Email": st.column_config.TextColumn("Email"),
+            "Team": st.column_config.SelectboxColumn("Team", options=names, required=True),
+        })
+    c1, c2 = st.columns([1, 3])
+    if c1.button("💾 Save member changes", type="primary", key="members_save"):
+        rows = [{"name": str(r.get("Name") or ""), "email": str(r.get("Email") or ""),
+                 "team": str(r.get("Team") or "")}
+                for r in edited.fillna("").to_dict("records")]
+        ok, msg, _chg = logic.save_game_members(gid, rows)
+        if ok:
+            st.session_state["_members_ver"] = ver + 1
+            st.session_state["_members_flash"] = msg
+            st.rerun()
+        else:
+            st.error(msg + " Nothing was saved — fix it and save again (your edits are kept).")
+    flash = st.session_state.pop("_members_flash", None)
+    if flash:
+        c2.success(flash)
 
 
 def team_setup():
@@ -1181,10 +1230,43 @@ def team_setup():
     st.caption("Upload a class contact list. Each **Class + Section** becomes its own game, "
                "each **Team** number becomes a team, and the members are saved to that team's "
                "roster. Names in your file are only used as the roster.")
-    st.download_button(
-        "⬇️ Download example template (.xlsx)", _roster_template_bytes(), "roster_template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        help="Columns: FirstName, LastName, PrimaryEmail, Class, Section, Team.")
+    _tpl = _roster_template_bytes()
+    _, _tinfo = db.get_stored_file(db.ROSTER_TEMPLATE_NAME)
+    if _tpl:
+        st.download_button(
+            "⬇️ Download example template (Example_Template.xlsx)", _tpl,
+            db.ROSTER_TEMPLATE_NAME, mime=db.XLSX_MIME,
+            help="Columns: FirstName, LastName, PrimaryEmail, Class, Section, Team (plus "
+                 "helper columns that fill themselves in). Type Class and Section once in row "
+                 "2; the rows below copy them.")
+    else:
+        st.warning("The example template is missing from the database — use Restore below.")
+    with st.expander("Replace or restore the example template"):
+        st.caption("The template is stored in the database, so it's the same for every login "
+                   "and survives restarts. "
+                   + (f"Current: **{_tinfo['source']}** version, saved {_tinfo['updated_at'][:16]}."
+                      if _tinfo else ""))
+        new_tpl = st.file_uploader("Upload a replacement template (.xlsx)", type=["xlsx"],
+                                   key="tpl_upload")
+        r1, r2 = st.columns(2)
+        if new_tpl is not None and r1.button("Save as the example template", key="tpl_save"):
+            try:
+                hdrs, _rows = logic.read_table(new_tpl.getvalue(), new_tpl.name)
+                need = {"firstname", "lastname", "class", "section", "team"}
+                have = {h.strip().lower() for h in hdrs}
+                missing = sorted(need - have)
+            except Exception as exc:   # noqa: BLE001
+                missing, hdrs = [f"(unreadable: {exc})"], []
+            if missing:
+                st.error("That file is missing required columns: " + ", ".join(missing))
+            else:
+                db.put_stored_file(db.ROSTER_TEMPLATE_NAME, new_tpl.getvalue(), "uploaded")
+                st.success("Saved. Everyone now downloads this file.")
+                st.rerun()
+        if r2.button("Restore the original template", key="tpl_restore"):
+            db.restore_shipped_file(db.ROSTER_TEMPLATE_NAME)
+            st.success("Original template restored.")
+            st.rerun()
 
     up = st.file_uploader("Roster file", type=["xlsx", "csv"], key="roster_upload")
     if up is not None:
@@ -1230,6 +1312,8 @@ def team_setup():
                            f"({summ['members']} members). Switch games in the sidebar to manage each.")
                 st.rerun()
 
+    st.divider()
+    _members_editor()
     st.divider()
 
     # ---- Quick balanced setup ------------------------------------------------

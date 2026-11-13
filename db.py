@@ -640,6 +640,10 @@ def _stage1_schema(conn, pg):
 
 def _stage2_schema(conn, pg):
     """Stage 2 additive migrations (per-game layout, grading, review, pitch, etc.)."""
+    # Files the app serves (e.g. the roster template), kept IN the database so they
+    # survive restarts, redeploys and logins, and travel with backups.
+    conn.execute("""CREATE TABLE IF NOT EXISTS stored_files (
+        name TEXT PRIMARY KEY, data TEXT NOT NULL, mime TEXT, source TEXT, updated_at TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS game_schedule (
         game_id INTEGER NOT NULL, round INTEGER NOT NULL, advance_at TEXT,
         PRIMARY KEY (game_id, round))""")
@@ -660,6 +664,85 @@ def _stage2_schema(conn, pg):
         reflection_id INTEGER PRIMARY KEY, team_id INTEGER NOT NULL, student_name TEXT,
         round INTEGER, rating TEXT, note TEXT, rated_at TEXT,
         FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE)""")
+
+
+ROSTER_TEMPLATE_NAME = "Example_Template.xlsx"
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+
+
+def _seed_stored_files(conn):
+    """Put the shipped roster template into the database once (never overwrites a
+    template the instructor uploaded)."""
+    import base64
+    path = os.path.join(_ASSET_DIR, ROSTER_TEMPLATE_NAME)
+    if not os.path.exists(path):
+        return
+    if conn.execute("SELECT 1 FROM stored_files WHERE name=?", (ROSTER_TEMPLATE_NAME,)).fetchone():
+        return
+    with open(path, "rb") as fh:
+        data = base64.b64encode(fh.read()).decode("ascii")
+    conn.execute("INSERT OR IGNORE INTO stored_files(name, data, mime, source, updated_at) "
+                  "VALUES(?,?,?,?,?)", (ROSTER_TEMPLATE_NAME, data, XLSX_MIME, "shipped", now()))
+
+
+@run_memo
+def get_stored_file(name):
+    """(bytes, info) for a stored file, or (None, None)."""
+    import base64
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT * FROM stored_files WHERE name=?", (name,)).fetchone()
+        if not row:
+            return None, None
+        info = {k: row[k] for k in ("name", "mime", "source", "updated_at")}
+        return base64.b64decode(row["data"]), info
+    finally:
+        conn.close()
+
+
+def put_stored_file(name, data, source="uploaded", mime=XLSX_MIME):
+    import base64
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO stored_files(name, data, mime, source, updated_at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET data=excluded.data, mime=excluded.mime, "
+            "source=excluded.source, updated_at=excluded.updated_at",
+            (name, base64.b64encode(data).decode("ascii"), mime, source, now()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def restore_shipped_file(name):
+    path = os.path.join(_ASSET_DIR, name)
+    with open(path, "rb") as fh:
+        put_stored_file(name, fh.read(), source="shipped")
+
+
+def set_game_rosters(game_id, rosters):
+    """Replace the member rosters of the teams in ONE game, atomically.
+    rosters = {team_id: [{"name", "email"}, ...]}; every team id must belong to the game."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        valid = {r["id"] for r in conn.execute("SELECT id FROM teams WHERE game_id=?"
+                                               + (" FOR UPDATE" if IS_PG else ""),
+                                               (game_id,)).fetchall()}
+        bad = [t for t in rosters if t not in valid]
+        if bad:
+            conn.rollback()
+            raise ValueError(f"Team(s) {bad} are not in this game.")
+        for tid in valid:
+            conn.execute("UPDATE teams SET roster=? WHERE id=? AND game_id=?",
+                         (_dumps(rosters.get(tid, [])), tid, game_id))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _normalize_dedupe(*parts):
@@ -703,6 +786,7 @@ def _init_db():
             pass   # e.g. a filesystem that can't do WAL — fall back to the default
         _create_schema(conn, IS_PG)
         _backfill_stage1(conn)
+        _seed_stored_files(conn)
         # Seed default settings once.
         cur = conn.execute("SELECT value FROM settings WHERE key='current_round'")
         if cur.fetchone() is None:

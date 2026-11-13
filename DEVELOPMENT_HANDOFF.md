@@ -143,6 +143,15 @@ Tests added: `tests/test_review_fixes.py` (12). Load-test tool: `tools/load_test
 
 **Rollback:** redeploy `27e5c08`. Old code ignores the new tables and columns. One caveat: per-game settings written after deploy live under `<key>@g<id>` and are ignored by the old code, so a rollback reverts to the deployment-wide settings.
 
+## Roster template + member editing (2026-11-13, branch `dev/roster-members`)
+
+- `assets/Example_Template.xlsx` — the instructor's ContactList workbook, byte-for-byte except personal data: emails, mailto hyperlinks and author fields replaced with `student@example.edu` / "Venture Foundry" (public repo). Formatting, formulas, array formulas kept.
+- New table `stored_files(name, data base64, mime, source, updated_at)`; seeded once from the asset on `init_db` (never overwrites). `db.get_stored_file / put_stored_file / restore_shipped_file`. Included in SQLite and Postgres backups (backup walks all tables).
+- Team Setup: download button serves the DB copy as `Example_Template.xlsx`; expander to replace (header-checked) or restore it.
+- `logic.parse_roster`: numeric cells normalized (1.0 → "1"), blank formula rows skipped, Class/Section carried down.
+- Members editor: `logic.game_members`, `logic.save_game_members` (validates; returns added/moved/removed) → `db.set_game_rosters` (one locked transaction; rejects teams from another game). Rosters remain `teams.roster` JSON — no schema change to teams.
+- Tests: `tests/test_roster.py` (11). Suite: 129 passed SQLite; 127 passed + 2 skipped on Postgres 16.
+
 ## Known limitations / unresolved
 - **Experiment-result writes:** evidence and credit are atomic in one transaction. The follow-on assumption-status refresh is a separate write; it is idempotent and is recomputed on the next evidence or result event if it is ever interrupted.
 - **Legacy experiments:** those without numeric thresholds keep a manual outcome, with no override reason required.

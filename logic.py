@@ -3270,15 +3270,23 @@ def parse_roster(headers, rows):
     warnings = []
     games = {}      # game_name -> {team_label -> [members]}
     order = []      # preserve game order
+    last_cls = last_sec = ""
     for raw in rows:
         r = _norm_row(raw)
-        cls = str(r.get("class") or "").strip()
-        section = str(r.get("section") or "").strip()
-        team = str(r.get("team") or "").strip()
-        first = str(r.get("first") or "").strip()
-        last = str(r.get("last") or "").strip()
-        email = str(r.get("email") or "").strip()
+        cls = _cell_text(r.get("class"))
+        section = _cell_text(r.get("section"))
+        team = _cell_text(r.get("team"))
+        first = _cell_text(r.get("first"))
+        last = _cell_text(r.get("last"))
+        email = _cell_text(r.get("email"))
         name = (first + " " + last).strip() or email
+        if not name and not team:
+            continue                     # an empty template row (formulas only) — ignore
+        # The Example_Template carries Class/Section down from row 2 with formulas; if a
+        # file was saved without calculated values, carry them down here the same way.
+        cls = cls or last_cls
+        section = section or last_sec
+        last_cls, last_sec = cls, section
         if not (cls or section) or not team:
             warnings.append(f"Skipped a row missing Class/Section or Team: {name or raw}")
             continue
@@ -3298,6 +3306,72 @@ def parse_roster(headers, rows):
                                         key=lambda kv: _team_sort_key(kv[0]))]
         result.append({"game": gname, "teams": teams})
     return result, warnings
+
+
+def _cell_text(v):
+    """A spreadsheet cell as clean text (1.0 → '1', None → '')."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return str(v).strip()
+
+
+def game_members(game_id=None):
+    """Every rostered member of a game's teams: [{name, email, team_id, team}]."""
+    gid = game_id if game_id is not None else db.active_game_id()
+    out = []
+    for t in db.list_teams(gid):
+        try:
+            roster = json.loads(t.get("roster") or "[]") if not isinstance(t.get("roster"), list) \
+                else t["roster"]
+        except (ValueError, TypeError):
+            roster = []
+        for m in roster or []:
+            if isinstance(m, dict):
+                out.append({"name": (m.get("name") or "").strip(),
+                            "email": (m.get("email") or "").strip(),
+                            "team_id": t["id"], "team": t["name"]})
+            elif str(m).strip():
+                out.append({"name": str(m).strip(), "email": "", "team_id": t["id"],
+                            "team": t["name"]})
+    return out
+
+
+def save_game_members(game_id, rows):
+    """Validate and save an edited member list for one game (add / move / remove).
+    rows = [{name, email, team}] where team is a team NAME in this game. Returns
+    (ok, message, changes{added, moved, removed})."""
+    teams = {t["name"]: t["id"] for t in db.list_teams(game_id)}
+    before = {(m["name"].lower(), m["email"].lower()): m["team_id"] for m in game_members(game_id)}
+    rosters = {tid: [] for tid in teams.values()}
+    seen = set()
+    for i, r in enumerate(rows, 1):
+        name = (r.get("name") or "").strip()
+        email = (r.get("email") or "").strip()
+        team = (r.get("team") or "").strip()
+        if not name and not email and not team:
+            continue                                  # an empty new row
+        if not name:
+            return False, f"Row {i}: enter the member's name.", {}
+        if team not in teams:
+            return False, f"Row {i} ({name}): choose a team.", {}
+        if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            return False, f"Row {i} ({name}): '{email}' doesn't look like an email address.", {}
+        key = (name.lower(), teams[team])
+        if key in seen:
+            return False, f"{name} is listed twice in {team}.", {}
+        seen.add(key)
+        rosters[teams[team]].append({"name": name, "email": email})
+    after = {(m["name"].lower(), m["email"].lower()): tid
+             for tid, ms in rosters.items() for m in ms}
+    changes = {"added": sum(1 for k in after if k not in before),
+               "removed": sum(1 for k in before if k not in after),
+               "moved": sum(1 for k in after if k in before and before[k] != after[k])}
+    db.set_game_rosters(game_id, rosters)
+    db.invalidate_run_cache()
+    return True, (f"Saved: {changes['added']} added, {changes['moved']} moved, "
+                  f"{changes['removed']} removed."), changes
 
 
 def _team_sort_key(label):
